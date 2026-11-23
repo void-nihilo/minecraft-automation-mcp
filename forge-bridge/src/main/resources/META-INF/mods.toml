@@ -1,0 +1,37 @@
+modLoader="javafml"
+loaderVersion="[47,48)"
+license="All Rights Reserved"
+
+[[mods]]
+modId="minecraft_automation_mcp"
+version="0.1.0"
+displayName="Minecraft Automation MCP Bridge"
+description="Local access to a running GTL singleplayer world."
+
+[[dependencies.minecraft_automation_mcp]]
+modId="forge"
+mandatory=true
+versionRange="[47.4.16,48)"
+ordering="NONE"
+side="BOTH"
+
+[[dependencies.minecraft_automation_mcp]]
+modId="minecraft"
+mandatory=true
+versionRange="[1.20.1,1.20.2)"
+ordering="NONE"
+side="BOTH"
+
+[[dependencies.minecraft_automation_mcp]]
+modId="ae2"
+mandatory=false
+versionRange="[15.4.10,16)"
+ordering="AFTER"
+side="BOTH"
+
+[[dependencies.minecraft_automation_mcp]]
+modId="gtceu"
+mandatory=false
+versionRange="[1.4.4,1.5)"
+ordering="AFTER"
+side="BOTH"

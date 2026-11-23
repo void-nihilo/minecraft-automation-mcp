@@ -1,0 +1,14 @@
+# Local build output and dependencies
+/forge-bridge/.gradle/
+/forge-bridge/build/
+/mcp/node_modules/
+
+# Local bridge credentials and instance settings
+minecraft-automation-mcp-bridge.token
+minecraft-automation-mcp-permissions.properties
+minecraft-automation-mcp-background-start
+minecraft-automation-mcp-test-target.json
+minecraft-automation-mcp-*-fixture.json
+
+# Local agent instructions
+/AGENTS.md
