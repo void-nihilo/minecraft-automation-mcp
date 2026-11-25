@@ -4,105 +4,67 @@ import appeng.api.config.Actionable;
 import appeng.api.networking.IGrid;
 import appeng.api.networking.security.IActionSource;
 import appeng.api.stacks.AEFluidKey;
+import appeng.api.stacks.AEItemKey;
 import appeng.api.storage.MEStorage;
-import appeng.blockentity.storage.DriveBlockEntity;
 import com.google.gson.JsonObject;
 import minecraft.automation.mcp.MinecraftAutomationBridge.BridgeError;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerLevel;
-import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraftforge.fluids.FluidType;
+import net.minecraftforge.fluids.FluidUtil;
 import net.minecraftforge.fluids.FluidStack;
-import net.minecraftforge.fluids.capability.IFluidHandler;
 import net.minecraftforge.registries.ForgeRegistries;
-
-import static net.minecraftforge.fluids.capability.IFluidHandler.FluidAction.EXECUTE;
-import static net.minecraftforge.fluids.capability.IFluidHandler.FluidAction.SIMULATE;
 
 final class MeFluidOperations {
     private MeFluidOperations() {}
 
-    static JsonObject transfer(ServerLevel tankLevel, BlockPos tankPosition, ServerLevel meLevel,
-                               BlockPos drivePosition, boolean toMe, ResourceLocation fluidId, int amount,
+    static JsonObject transfer(ServerLevel tankLevel, BlockPos tankPosition, Direction tankSide, MeOperations.Endpoint endpoint, boolean toMe, ResourceLocation fluidId, int amount,
                                String expectedSourceToken) {
         if (amount < 1) {
             throw new BridgeError(400, "invalid_transfer", "Specify a positive transfer amount in mB");
         }
-        IFluidHandler tank = TankOperations.tankAt(tankLevel, tankPosition);
-        FluidStack tankBefore = TankOperations.snapshot(tank);
-        IGrid grid = MeOperations.gridAt(meLevel, drivePosition);
-        IActionSource actor = MeOperations.playerAction(meLevel);
+        var tank = toMe ? TankOperations.tankAt(tankLevel, tankPosition, tankSide)
+                : TankOperations.fillingTarget(tankLevel, tankPosition, tankSide);
+        var tankBalances = TankOperations.balances(tank);
+        IGrid grid = endpoint.grid();
+        IActionSource actor = MeOperations.playerAction(endpoint.level());
         MEStorage storage = grid.getStorageService().getInventory();
 
         AEFluidKey key;
+        FluidStack moving;
         if (toMe) {
-            key = AEFluidKey.of(tankBefore);
-            if (key == null || !key.getId().equals(fluidId)
-                    || !TankOperations.fluidToken(tankBefore).equals(expectedSourceToken)) {
+            moving = TankOperations.select(tankBalances, expectedSourceToken, amount);
+            key = AEFluidKey.of(moving);
+            if (key == null || !key.getId().equals(fluidId)) {
                 throw new BridgeError(409, "source_changed", "Tank fluid no longer matches the tank read");
             }
-            if (tankBefore.getAmount() < amount) {
-                throw new BridgeError(409, "insufficient_fluid", "Source tank contains less fluid than requested");
-            }
+            TankOperations.requireDrain(tank, moving);
         } else {
             key = MeOperations.resolveMeStack(storage, AEFluidKey.class, fluidId, expectedSourceToken);
+            moving = key.toStack(amount);
+            TankOperations.requireFill(tank, moving);
         }
 
-        FluidStack moving = key.toStack(amount);
-        if (toMe) {
-            if (!TankOperations.matches(tank.drain(moving.copy(), SIMULATE), moving)) {
-                throw new BridgeError(409, "drain_refused", "Source tank cannot drain the full amount");
-            }
-        } else {
-            if ((!tankBefore.isEmpty() && !tankBefore.isFluidEqual(moving)) || !tank.isFluidValid(0, moving)) {
-                throw new BridgeError(409, "incompatible_fluid", "Target tank cannot accept this fluid");
-            }
-            if (tank.fill(moving.copy(), SIMULATE) != amount) {
-                throw new BridgeError(409, "target_full", "Target tank lacks room for the full transfer");
-            }
-        }
-
+        long tankBefore = TankOperations.amount(tankBalances, moving);
         long meBefore = MeOperations.count(storage, key);
         long meAfter;
-        int tankAfter;
+        long tankAfter;
         int moved = amount;
         if (toMe) {
-            FluidStack expectedTank = key.toStack(tankBefore.getAmount() - amount);
-            moved = MeOperations.deposit(grid, storage, actor, key, amount, () -> {
-                if (!TankOperations.matches(tank.drain(moving.copy(), EXECUTE), moving)
-                        || !TankOperations.matches(TankOperations.snapshot(tank), expectedTank)) {
-                    throw new BridgeError(409, "transfer_refused", "The source tank did not drain the planned amount");
-                }
-            }, accepted -> TankOperations.restore(tank, key.toStack(tankBefore.getAmount() - accepted), moving));
+            moved = MeOperations.deposit(grid, storage, actor, key, amount,
+                    () -> TankOperations.drain(tank, tankBalances, moving),
+                    accepted -> TankOperations.restore(tank, tankBalances, moving, -accepted));
             meAfter = MeOperations.count(storage, key);
-            tankAfter = TankOperations.snapshot(tank).getAmount();
+            tankAfter = tankBefore - moved;
         } else {
-            MeOperations.requireWithdrawal(grid, storage, actor, key, amount);
-            meAfter = Math.subtractExact(meBefore, amount);
-            tankAfter = tankBefore.getAmount() + amount;
-            FluidStack expectedTank = key.toStack(tankAfter);
-            try {
-                if (MeOperations.mutateMe(grid, storage, actor, key, amount, false, Actionable.MODULATE) != amount) {
-                    throw new BridgeError(409, "me_transfer_refused", "ME did not extract the planned amount");
-                }
-                if (tank.fill(moving.copy(), EXECUTE) != amount) {
-                    throw new BridgeError(409, "transfer_refused", "The target tank did not accept the planned amount");
-                }
-                if (MeOperations.count(storage, key) != meAfter
-                        || !TankOperations.matches(TankOperations.snapshot(tank), expectedTank)) {
-                    throw new BridgeError(409, "balance_mismatch", "Tank and ME did not retain the planned balances");
-                }
-            } catch (RuntimeException failure) {
-                try {
-                    TankOperations.restore(tank, tankBefore, moving);
-                    MeOperations.restoreMe(storage, actor, key, meBefore);
-                } catch (RuntimeException rollbackError) {
-                    failure.addSuppressed(rollbackError);
-                    throw new IllegalStateException("ME fluid transfer rollback did not finish", failure);
-                }
-                throw failure;
-            }
+            meAfter = MeOperations.withdraw(grid, storage, actor, key, amount, meBefore,
+                    () -> TankOperations.fill(tank, tankBalances, moving),
+                    () -> TankOperations.restore(tank, tankBalances, moving, 0));
+            tankAfter = tankBefore + amount;
         }
 
         JsonObject result = new JsonObject();
@@ -110,49 +72,73 @@ final class MeFluidOperations {
         result.addProperty("fluid", fluidId.toString());
         result.addProperty("requested", amount);
         result.addProperty("moved", moved);
-        result.addProperty("tankBefore", tankBefore.getAmount());
+        result.addProperty("tankBefore", tankBefore);
         result.addProperty("tankAfter", tankAfter);
         result.addProperty("meBefore", meBefore);
         result.addProperty("meAfter", meAfter);
-        result.addProperty("totalBefore", meBefore + tankBefore.getAmount());
+        result.addProperty("totalBefore", meBefore + tankBefore);
         result.addProperty("totalAfter", meAfter + tankAfter);
         return result;
     }
 
-    static JsonObject prepareTestFluidCell(ServerLevel level, BlockPos position) {
-        if (!(level.getBlockEntity(position) instanceof DriveBlockEntity drive) || drive.isRemoved()) {
-            throw new BridgeError(409, "not_me_drive", "The position must contain an ME Drive");
+    static JsonObject fillBucket(MeOperations.Endpoint endpoint, ResourceLocation fluidId,
+                                 String fluidToken, String bucketToken) {
+        IGrid grid = endpoint.grid();
+        MEStorage storage = grid.getStorageService().getInventory();
+        IActionSource actor = MeOperations.playerAction(endpoint.level());
+        AEFluidKey fluid = MeOperations.resolveMeStack(storage, AEFluidKey.class, fluidId, fluidToken);
+        AEItemKey emptyBucket = MeOperations.resolveMeStack(storage, AEItemKey.class,
+                ForgeRegistries.ITEMS.getKey(Items.BUCKET), bucketToken);
+        int amount = FluidType.BUCKET_VOLUME;
+        FluidStack requested = fluid.toStack(amount);
+        ItemStack filled = FluidUtil.getFilledBucket(requested);
+        AEItemKey filledBucket = AEItemKey.of(filled);
+        if (filledBucket == null || filled.is(Items.BUCKET)
+                || FluidUtil.getFluidContained(filled)
+                        .filter(contents -> TankOperations.matches(contents, requested)).isEmpty()) {
+            throw new BridgeError(409, "unsupported_bucket_fluid",
+                    "The exact fluid cannot be stored in a filled bucket");
         }
-        Item cell = ForgeRegistries.ITEMS.getValue(ResourceLocation.tryParse("ae2:fluid_storage_cell_1k"));
-        if (cell == null || cell == net.minecraft.world.item.Items.AIR) {
-            throw new BridgeError(409, "fixture_unavailable", "The AE2 1k fluid storage cell is unavailable");
-        }
-        var inventory = drive.getInternalInventory();
-        int emptySlot = -1;
-        for (int slot = 0; slot < inventory.size(); slot++) {
-            ItemStack existing = inventory.getStackInSlot(slot);
-            if (existing.is(cell)) {
-                return cellResult(slot, false);
-            }
-            if (emptySlot < 0 && existing.isEmpty()) {
-                emptySlot = slot;
-            }
-        }
-        if (emptySlot < 0) {
-            throw new BridgeError(409, "drive_full", "The test ME Drive has no empty cell slot");
-        }
-        inventory.setItemDirect(emptySlot, new ItemStack(cell));
-        if (!inventory.getStackInSlot(emptySlot).is(cell)) {
-            throw new BridgeError(409, "fixture_refused", "The ME Drive did not retain the fluid cell");
-        }
-        return cellResult(emptySlot, true);
-    }
 
-    private static JsonObject cellResult(int slot, boolean installed) {
+        MeOperations.requireWithdrawal(grid, storage, actor, fluid, amount);
+        MeOperations.requireWithdrawal(grid, storage, actor, emptyBucket, 1);
+        long fluidBefore = MeOperations.count(storage, fluid);
+        long emptyBefore = MeOperations.count(storage, emptyBucket);
+        long filledBefore = MeOperations.count(storage, filledBucket);
+        long filledExpected = filledBefore == Long.MAX_VALUE ? filledBefore : filledBefore + 1;
+
+        try {
+            if (MeOperations.mutateMe(grid, storage, actor, fluid, amount, false, Actionable.MODULATE) != amount
+                    || !MeOperations.matchesWithdrawal(fluidBefore, amount, MeOperations.count(storage, fluid))
+                    || MeOperations.mutateMe(grid, storage, actor, emptyBucket, 1, false, Actionable.MODULATE) != 1
+                    || !MeOperations.matchesWithdrawal(emptyBefore, 1, MeOperations.count(storage, emptyBucket))) {
+                throw new BridgeError(409, "bucket_input_refused", "ME did not provide the requested fluid and bucket");
+            }
+            if (MeOperations.mutateMe(grid, storage, actor, filledBucket, 1, true, Actionable.SIMULATE) != 1
+                    || MeOperations.mutateMe(grid, storage, actor, filledBucket, 1, true, Actionable.MODULATE) != 1
+                    || MeOperations.count(storage, filledBucket) != filledExpected) {
+                throw new BridgeError(409, "bucket_output_refused", "ME did not retain the filled bucket");
+            }
+        } catch (RuntimeException failure) {
+            try {
+                MeOperations.restoreMe(storage, actor, filledBucket, filledBefore);
+                MeOperations.restoreMe(storage, actor, emptyBucket, emptyBefore);
+                MeOperations.restoreMe(storage, actor, fluid, fluidBefore);
+            } catch (RuntimeException rollback) {
+                failure.addSuppressed(rollback);
+                throw new IllegalStateException("ME bucket filling rollback did not finish", failure);
+            }
+            throw failure;
+        }
+
         JsonObject result = new JsonObject();
-        result.addProperty("item", "ae2:fluid_storage_cell_1k");
-        result.addProperty("slot", slot);
-        result.addProperty("installed", installed);
+        result.addProperty("fluid", fluidId.toString());
+        result.addProperty("amount", amount);
+        result.addProperty("item", filledBucket.getId().toString());
+        result.addProperty("count", 1);
+        result.addProperty("fluidAfter", MeOperations.count(storage, fluid));
+        result.addProperty("emptyBucketsAfter", MeOperations.count(storage, emptyBucket));
+        result.addProperty("filledBucketsAfter", MeOperations.count(storage, filledBucket));
         return result;
     }
 }

@@ -2,7 +2,6 @@ package minecraft.automation.mcp;
 
 import com.google.gson.JsonObject;
 import com.mojang.logging.LogUtils;
-import minecraft.automation.mcp.ChestOperations.SlotChange;
 import minecraft.automation.mcp.MinecraftAutomationBridge.BridgeError;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
@@ -15,6 +14,7 @@ import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.LeavesBlock;
 import net.minecraft.world.level.block.RotatedPillarBlock;
 import net.minecraft.world.level.block.entity.ChestBlockEntity;
+import net.minecraftforge.items.IItemHandler;
 import net.minecraft.world.level.block.state.BlockState;
 import org.slf4j.Logger;
 
@@ -45,12 +45,17 @@ final class TreeFarmOperations {
     private long saplingsPlanted;
 
     JsonObject start(ServerLevel level, BlockPos root, BlockPos supply, BlockPos output, String treeName) {
+        return start(level, root, supply, null, output, null, treeName);
+    }
+
+    JsonObject start(ServerLevel level, BlockPos root, BlockPos supply, Direction supplySide,
+                     BlockPos output, Direction outputSide, String treeName) {
         Tree tree = switch (treeName) {
             case "oak" -> new Tree(treeName, Blocks.OAK_SAPLING, Blocks.OAK_LOG, Blocks.OAK_LEAVES);
             case "birch" -> new Tree(treeName, Blocks.BIRCH_SAPLING, Blocks.BIRCH_LOG, Blocks.BIRCH_LEAVES);
             default -> throw new IllegalArgumentException("Tree must be oak or birch");
         };
-        Plot requested = new Plot(level, root, supply, output, tree);
+        Plot requested = new Plot(level, root, supply, output, tree, supplySide, outputSide);
         if (requested.equals(plot)) {
             return status();
         }
@@ -58,11 +63,11 @@ final class TreeFarmOperations {
             throw blocked("farm_exists", "Stop the existing tree farm before starting another");
         }
         if (supply.equals(output) || insideGuard(root, supply) || insideGuard(root, output)) {
-            throw blocked("invalid_chests", "Use two different chest positions outside the tree plot and its border");
+            throw blocked("invalid_containers", "Use two different container positions outside the tree plot and its border");
         }
         checkArea(requested);
-        ChestOperations.chestAt(level, supply);
-        ChestOperations.chestAt(level, output);
+        ItemHandlerOperations.at(level, supply, supplySide);
+        ItemHandlerOperations.at(level, output, outputSide);
         checkRoot(requested);
         treeLogs(requested);
         plot = requested;
@@ -83,6 +88,12 @@ final class TreeFarmOperations {
             result.add("position", MinecraftAutomationBridge.positionJson(plot.root));
             result.add("supply", MinecraftAutomationBridge.positionJson(plot.supply));
             result.add("output", MinecraftAutomationBridge.positionJson(plot.output));
+            if (plot.supplySide != null) {
+                result.addProperty("supplySide", plot.supplySide.getName());
+            }
+            if (plot.outputSide != null) {
+                result.addProperty("outputSide", plot.outputSide.getName());
+            }
             result.addProperty("treesHarvested", treesHarvested);
             result.addProperty("logsStored", logsStored);
             result.addProperty("saplingsPlanted", saplingsPlanted);
@@ -200,7 +211,7 @@ final class TreeFarmOperations {
             LOGGER.error("Minecraft Automation MCP tree farm stopped at {} after an unexpected error", plot.root, failure);
             state = "error";
             problem = "farm_error";
-            detail = "Inspect the tree plot and chests before stopping and restarting the farm";
+            detail = "Inspect the tree plot and containers before stopping and restarting the farm";
         }
     }
 
@@ -213,20 +224,18 @@ final class TreeFarmOperations {
         }
 
         Map<BlockPos, BlockState> logs = treeLogs(plot);
-        List<SlotChange> changes = new ArrayList<>();
-        ChestBlockEntity supply = ChestOperations.chestAt(plot.level, plot.supply);
-        ChestBlockEntity output = ChestOperations.chestAt(plot.level, plot.output);
-        changes.add(reserveSapling(supply, plot.tree));
+        var supply = ItemHandlerOperations.at(plot.level, plot.supply, plot.supplySide);
+        Sapling sapling = reserveSapling(supply, plot.tree);
+        ItemHandlerOperations.InsertionPlan outputPlan = null;
         if (!logs.isEmpty()) {
-            ItemStack wood = new ItemStack(plot.tree.log);
-            int remaining = ChestOperations.planInsertions(output, wood, logs.size(), false, changes);
-            remaining = ChestOperations.planInsertions(output, wood, remaining, true, changes);
-            if (remaining != 0) {
-                throw blocked("output_full", "The log chest needs room for the whole tree");
+            var output = ItemHandlerOperations.insertionTarget(plot.level, plot.output, plot.outputSide);
+            if (supply == output) {
+                throw blocked("invalid_containers", "Supply and output expose the same item handler");
             }
+            outputPlan = ItemHandlerOperations.planInsertion(output, new ItemStack(plot.tree.log, logs.size()), null);
         }
 
-        harvestAndPlant(plot, rootState, logs, changes);
+        harvestAndPlant(plot, rootState, logs, sapling, outputPlan);
         saplingsPlanted++;
         if (!logs.isEmpty()) {
             treesHarvested++;
@@ -240,16 +249,16 @@ final class TreeFarmOperations {
         BlockPos max = plot.root.offset(RADIUS + 1, HEIGHT, RADIUS + 1);
         for (BlockPos position : List.of(min, max, plot.supply, plot.output)) {
             if (!plot.level.isInWorldBounds(position) || !plot.level.getWorldBorder().isWithinBounds(position)) {
-                throw blocked("farm_out_of_bounds", "The tree plot and both chests must be inside the world bounds");
+                throw blocked("farm_out_of_bounds", "The tree plot and both containers must be inside the world bounds");
             }
             if (!plot.level.hasChunkAt(position)) {
-                throw blocked("chunk_not_loaded", "The full tree plot and both chests must be loaded");
+                throw blocked("chunk_not_loaded", "The full tree plot and both containers must be loaded");
             }
         }
         // The guarded plot spans at most two chunks per axis. Check the two other corners too.
         if (!plot.level.hasChunkAt(new BlockPos(min.getX(), min.getY(), max.getZ()))
                 || !plot.level.hasChunkAt(new BlockPos(max.getX(), min.getY(), min.getZ()))) {
-            throw blocked("chunk_not_loaded", "The full tree plot and both chests must be loaded");
+            throw blocked("chunk_not_loaded", "The full tree plot and both containers must be loaded");
         }
     }
 
@@ -333,20 +342,22 @@ final class TreeFarmOperations {
         return block != null && block.getValue(RotatedPillarBlock.AXIS) == Direction.Axis.Y;
     }
 
-    private static SlotChange reserveSapling(ChestBlockEntity supply, Tree tree) {
-        for (int slot = 0; slot < supply.getContainerSize(); slot++) {
-            ItemStack stack = supply.getItem(slot);
-            if (stack.is(tree.sapling.asItem())) {
-                return new SlotChange(supply, slot, stack.copy(), stack.copyWithCount(stack.getCount() - 1));
+    private static Sapling reserveSapling(IItemHandler supply, Tree tree) {
+        for (int slot = 0; slot < supply.getSlots(); slot++) {
+            ItemStack stack = supply.getStackInSlot(slot).copy();
+            if (stack.is(tree.sapling.asItem())
+                    && ItemStack.matches(supply.extractItem(slot, 1, true), stack.copyWithCount(1))) {
+                return new Sapling(supply, slot, stack);
             }
         }
-        throw blocked("no_saplings", "Add matching saplings to the supply chest");
+        throw blocked("no_saplings", "The supply container needs an extractable matching sapling");
     }
 
     private static void harvestAndPlant(Plot plot, BlockState rootState, Map<BlockPos, BlockState> logs,
-                                        List<SlotChange> changes) {
+                                        Sapling supply, ItemHandlerOperations.InsertionPlan output) {
         List<BlockPos> cleared = new ArrayList<>();
         BlockState sapling = plot.tree.sapling.defaultBlockState();
+        boolean supplyAttempted = false;
         try {
             List<BlockPos> branches = logs.keySet().stream().filter(position -> !position.equals(plot.root))
                     .sorted(Comparator.comparingInt((BlockPos position) -> position.getY()).reversed()).toList();
@@ -356,11 +367,33 @@ final class TreeFarmOperations {
             }
             cleared.add(plot.root);
             replace(plot.level, plot.root, rootState, sapling);
-            if (!ChestOperations.matchesBefore(changes)) {
-                throw blocked("chest_changed", "A chest slot changed while planting");
+            if (!ItemStack.matches(supply.handler.getStackInSlot(supply.slot), supply.before)) {
+                throw blocked("source_changed", "The sapling slot changed while planting");
             }
-            ChestOperations.applyChanges(changes);
+            supplyAttempted = true;
+            ItemHandlerOperations.extract(supply.handler, supply.slot, supply.before, 1);
+            if (output != null) {
+                output.apply();
+            }
+            if (!ItemStack.matches(supply.handler.getStackInSlot(supply.slot),
+                    supply.before.copyWithCount(supply.before.getCount() - 1))) {
+                throw blocked("balance_mismatch", "The supply and output may share item storage");
+            }
         } catch (RuntimeException failure) {
+            if (supplyAttempted) {
+                try {
+                    if (output != null) {
+                        output.restore();
+                    }
+                    ItemHandlerOperations.restoreSlot(supply.handler, supply.slot, supply.before, supply.before);
+                    if (output != null) {
+                        output.verifyOriginal();
+                    }
+                } catch (RuntimeException rollback) {
+                    failure.addSuppressed(rollback);
+                    throw new IllegalStateException("Tree farm inventory rollback did not finish", failure);
+                }
+            }
             for (int index = cleared.size() - 1; index >= 0; index--) {
                 BlockPos position = cleared.get(index);
                 BlockState original = position.equals(plot.root) ? rootState : logs.get(position);
@@ -396,5 +429,12 @@ final class TreeFarmOperations {
 
     private record Tree(String name, Block sapling, Block log, Block leaves) {}
 
-    private record Plot(ServerLevel level, BlockPos root, BlockPos supply, BlockPos output, Tree tree) {}
+    private record Sapling(IItemHandler handler, int slot, ItemStack before) {}
+
+    private record Plot(ServerLevel level, BlockPos root, BlockPos supply, BlockPos output, Tree tree,
+                        Direction supplySide, Direction outputSide) {
+        Plot(ServerLevel level, BlockPos root, BlockPos supply, BlockPos output, Tree tree) {
+            this(level, root, supply, output, tree, null, null);
+        }
+    }
 }

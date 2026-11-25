@@ -1,6 +1,7 @@
 package minecraft.automation.mcp;
 
 import appeng.api.config.Actionable;
+import appeng.api.networking.GridHelper;
 import appeng.api.networking.IGrid;
 import appeng.api.networking.IGridNode;
 import appeng.api.networking.security.IActionSource;
@@ -9,38 +10,45 @@ import appeng.api.stacks.AEKey;
 import appeng.api.stacks.KeyCounter;
 import appeng.api.storage.MEStorage;
 import appeng.api.storage.StorageHelper;
-import appeng.blockentity.storage.DriveBlockEntity;
 import com.google.common.hash.Hashing;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
-import minecraft.automation.mcp.ChestOperations.SlotChange;
 import minecraft.automation.mcp.MinecraftAutomationBridge.BridgeError;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerLevel;
-import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
-import net.minecraft.world.level.block.Block;
-import net.minecraft.world.level.block.Blocks;
-import net.minecraft.world.level.block.entity.ChestBlockEntity;
-import net.minecraftforge.registries.ForgeRegistries;
+import net.minecraftforge.items.IItemHandler;
 
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.function.IntConsumer;
 
 final class MeOperations {
     private MeOperations() {}
 
-    static JsonObject contents(ServerLevel level, BlockPos position, ResourceLocation id,
+    static JsonObject contents(Endpoint endpoint, ResourceLocation id,
                                Class<? extends AEKey> type, String field) {
-        IGrid grid = gridAt(level, position);
-        JsonArray variants = new JsonArray();
-        long total = 0;
+        return contents(endpoint, List.of(id), type, field).get(0).getAsJsonObject();
+    }
+
+    static JsonArray contents(Endpoint endpoint, List<ResourceLocation> ids,
+                              Class<? extends AEKey> type, String field) {
+        IGrid grid = endpoint.grid();
+        var byId = new LinkedHashMap<ResourceLocation, JsonObject>();
+        for (ResourceLocation id : ids) {
+            JsonObject result = new JsonObject();
+            result.addProperty(field, id.toString());
+            result.addProperty("total", 0L);
+            result.add("variants", new JsonArray());
+            byId.putIfAbsent(id, result);
+        }
         for (var entry : grid.getStorageService().getInventory().getAvailableStacks()) {
             AEKey key = entry.getKey();
-            if (type.isInstance(key) && key.getId().equals(id)) {
+            JsonObject result = byId.get(key.getId());
+            if (result != null && type.isInstance(key)) {
                 long count = entry.getLongValue();
                 JsonObject variant = new JsonObject();
                 variant.addProperty("count", count);
@@ -52,73 +60,53 @@ final class MeOperations {
                         variant.addProperty("maxDamage", stack.getMaxDamage());
                     }
                 }
-                variants.add(variant);
-                total += count;
+                result.getAsJsonArray("variants").add(variant);
+                result.addProperty("total", result.get("total").getAsLong() + count);
             }
         }
-        JsonObject result = new JsonObject();
-        result.addProperty(field, id.toString());
-        result.addProperty("total", total);
-        result.add("variants", variants);
+        JsonArray result = new JsonArray();
+        byId.values().forEach(result::add);
         return result;
     }
 
-    static JsonObject transfer(ServerLevel chestLevel, BlockPos chestPosition, ServerLevel meLevel,
-                               BlockPos drivePosition, boolean toMe, ResourceLocation itemId, int amount,
-                               int sourceSlot, String expectedSourceToken) {
+    static JsonObject transfer(IItemHandler handler, Endpoint endpoint, boolean toMe, ResourceLocation itemId,
+                               int amount, Integer slot, String expectedSourceToken) {
+        return transfer(handler, endpoint.grid(), playerAction(endpoint.level),
+                toMe, itemId, amount, slot, expectedSourceToken);
+    }
+
+    static JsonObject transfer(IItemHandler handler, IGrid grid, IActionSource actor, boolean toMe,
+                               ResourceLocation itemId, int amount, Integer slot, String expectedSourceToken) {
         if (amount < 1) {
             throw new BridgeError(400, "invalid_transfer", "Specify a positive amount");
         }
-        ChestBlockEntity chest = ChestOperations.chestAt(chestLevel, chestPosition);
-        IGrid grid = gridAt(meLevel, drivePosition);
-        IActionSource actor = playerAction(meLevel);
         MEStorage storage = grid.getStorageService().getInventory();
         long before;
         long after;
         int moved = amount;
         if (toMe) {
-            if (sourceSlot < 0 || sourceSlot >= chest.getContainerSize()) {
-                throw new BridgeError(400, "invalid_source_slot", "Specify a valid chest slot for a deposit");
+            if (slot == null) {
+                throw new BridgeError(400, "invalid_source_slot", "Specify the source slot for a deposit");
             }
-            ItemStack current = chest.getItem(sourceSlot).copy();
+            ItemStack current = ItemHandlerOperations.sourceStack(handler, slot, amount, expectedSourceToken);
             AEItemKey key = AEItemKey.of(current);
-            if (key == null || !key.getId().equals(itemId)
-                    || !ChestOperations.stackToken(current).equals(expectedSourceToken)) {
-                throw new BridgeError(409, "source_changed", "Chest stack no longer matches the inventory read");
+            if (key == null || !key.getId().equals(itemId)) {
+                throw new BridgeError(409, "source_changed", "Source stack does not match the requested item");
             }
             if (!ItemStack.isSameItemSameTags(current, key.toStack())) {
                 throw new BridgeError(409, "unsupported_item", "AE2 cannot represent this stack exactly");
             }
-            if (current.getCount() < amount) {
-                throw new BridgeError(409, "insufficient_items", "Chest slot contains fewer items than requested");
-            }
             before = count(storage, key);
-            ItemStack withdrawn = current.copyWithCount(current.getCount() - amount);
             moved = deposit(grid, storage, actor, key, amount,
-                    () -> ChestOperations.applyChanges(List.of(new SlotChange(chest, sourceSlot, current, withdrawn))),
-                    accepted -> {
-                        ItemStack present = chest.getItem(sourceSlot).copy();
-                        ItemStack remaining = current.copyWithCount(current.getCount() - accepted);
-                        ChestOperations.applyChanges(List.of(new SlotChange(chest, sourceSlot, present, remaining)));
-                    });
+                    () -> ItemHandlerOperations.extract(handler, slot, current, amount),
+                    accepted -> ItemHandlerOperations.restoreSlot(handler, slot,
+                            current.copyWithCount(current.getCount() - accepted), current));
             after = count(storage, key);
         } else {
             AEItemKey key = resolveMeStack(storage, AEItemKey.class, itemId, expectedSourceToken);
-            ItemStack stack = key.toStack();
-            List<SlotChange> changes = new ArrayList<>();
-            int remaining = ChestOperations.planInsertions(chest, stack, amount, false, changes);
-            remaining = ChestOperations.planInsertions(chest, stack, remaining, true, changes);
-            if (remaining != 0) {
-                throw new BridgeError(409, "target_full", "Chest lacks room for the full transfer");
-            }
+            var plan = ItemHandlerOperations.planInsertion(handler, key.toStack(amount), slot);
             before = count(storage, key);
-            after = withdraw(grid, storage, actor, key, amount, before,
-                    () -> ChestOperations.applyChanges(changes),
-                    () -> {
-                        if (!ChestOperations.matchesBefore(changes)) {
-                            throw new IllegalStateException("Chest did not restore its original slots");
-                        }
-                    });
+            after = withdraw(grid, storage, actor, key, amount, before, plan::apply, plan::restore);
         }
 
         JsonObject result = new JsonObject();
@@ -172,11 +160,12 @@ final class MeOperations {
 
     static long withdraw(IGrid grid, MEStorage storage, IActionSource actor, AEKey key, int amount,
                          long before, Runnable putTarget, Runnable restoreTarget) {
-        long after = Math.subtractExact(before, amount);
         requireWithdrawal(grid, storage, actor, key, amount);
+        long after;
         try {
-            if (mutateMe(grid, storage, actor, key, amount, false, Actionable.MODULATE) != amount
-                    || count(storage, key) != after) {
+            long extracted = mutateMe(grid, storage, actor, key, amount, false, Actionable.MODULATE);
+            after = count(storage, key);
+            if (extracted != amount || !matchesWithdrawal(before, amount, after)) {
                 throw new BridgeError(409, "me_transfer_refused", "ME did not retain the planned balance");
             }
             putTarget.run();
@@ -191,6 +180,11 @@ final class MeOperations {
             throw failure;
         }
         return after;
+    }
+
+    static boolean matchesWithdrawal(long before, int amount, long after) {
+        // Creative cells can expose an inexhaustible stack as Long.MAX_VALUE.
+        return after == before - amount || (before == Long.MAX_VALUE && after == before);
     }
 
     static long mutateMe(IGrid grid, MEStorage storage, IActionSource actor, AEKey key,
@@ -219,7 +213,7 @@ final class MeOperations {
         throw new BridgeError(409, "source_changed", "ME stack no longer matches the inventory read");
     }
 
-    private static String meToken(AEKey key, long count) {
+    static String meToken(AEKey key, long count) {
         return Hashing.sha256().hashString(key.toTag() + ":" + count, StandardCharsets.UTF_8).toString();
     }
 
@@ -243,52 +237,46 @@ final class MeOperations {
         return IActionSource.ofPlayer(players.get(0));
     }
 
-    static IGrid gridAt(ServerLevel level, BlockPos position) {
-        if (!(level.getBlockEntity(position) instanceof DriveBlockEntity drive) || drive.isRemoved()) {
-            throw new BridgeError(409, "not_me_drive", "The position must contain an ME Drive");
-        }
-        IGridNode node = drive.getMainNode().getNode();
-        if (node == null || !node.isActive() || !node.getGrid().getEnergyService().isNetworkPowered()) {
-            throw new BridgeError(409, "me_offline", "ME Drive is waiting for power or a channel");
-        }
-        return node.getGrid();
-    }
-
-    static JsonObject prepareTestNetwork(ServerLevel level, BlockPos drivePosition, BlockPos powerPosition) {
-        if (drivePosition.distManhattan(powerPosition) != 1 || !MinecraftAutomationBridge.isClearFixtureSite(level, drivePosition)
-                || !MinecraftAutomationBridge.isClearFixtureSite(level, powerPosition)) {
-            throw new BridgeError(409, "fixture_site_unavailable", "Test network needs two neighboring air blocks above solid ground");
-        }
-        Block driveBlock = ForgeRegistries.BLOCKS.getValue(ResourceLocation.tryParse("ae2:drive"));
-        Block powerBlock = ForgeRegistries.BLOCKS.getValue(ResourceLocation.tryParse("ae2:creative_energy_cell"));
-        Item storageCell = ForgeRegistries.ITEMS.getValue(ResourceLocation.tryParse("ae2:item_storage_cell_1k"));
-        if (driveBlock == null || driveBlock == Blocks.AIR || powerBlock == null || powerBlock == Blocks.AIR
-                || storageCell == null) {
-            throw new BridgeError(409, "fixture_unavailable", "Required AE2 components are unavailable");
-        }
-        try {
-            if (!level.setBlock(drivePosition, driveBlock.defaultBlockState(), Block.UPDATE_ALL)
-                    || !level.setBlock(powerPosition, powerBlock.defaultBlockState(), Block.UPDATE_ALL)
-                    || !(level.getBlockEntity(drivePosition) instanceof DriveBlockEntity drive)) {
-                throw new BridgeError(409, "fixture_refused", "The world did not place both AE2 components");
+    record Endpoint(ServerLevel level, BlockPos position, Direction side) {
+        IGrid grid() {
+            if (!level.isInWorldBounds(position) || !level.hasChunkAt(position)) {
+                throw new BridgeError(409, "me_unavailable", "The ME endpoint must be in a loaded chunk");
             }
-            drive.getInternalInventory().setItemDirect(0, new ItemStack(storageCell));
-            JsonObject result = new JsonObject();
-            result.add("drive", MinecraftAutomationBridge.positionJson(drivePosition));
-            result.add("power", MinecraftAutomationBridge.positionJson(powerPosition));
-            return result;
-        } catch (RuntimeException failure) {
-            if (level.getBlockEntity(drivePosition) instanceof DriveBlockEntity drive) {
-                drive.getInternalInventory().setItemDirect(0, ItemStack.EMPTY);
+            var host = GridHelper.getNodeHost(level, position);
+            if (host == null) {
+                throw new BridgeError(409, "not_me_node", "The position does not expose an AE2 network node");
             }
-            if (level.getBlockState(drivePosition).is(driveBlock)) {
-                level.setBlock(drivePosition, Blocks.AIR.defaultBlockState(), Block.UPDATE_ALL);
+            if (side != null) {
+                return activeGrid(host.getGridNode(side));
             }
-            if (level.getBlockState(powerPosition).is(powerBlock)) {
-                level.setBlock(powerPosition, Blocks.AIR.defaultBlockState(), Block.UPDATE_ALL);
+            IGridNode selected = null;
+            IGrid selectedGrid = null;
+            for (Direction face : Direction.values()) {
+                IGridNode candidate = host.getGridNode(face);
+                if (candidate == null) {
+                    continue;
+                }
+                IGrid candidateGrid = candidate.getGrid();
+                if (candidateGrid == null) {
+                    continue;
+                }
+                if (selectedGrid != null && selectedGrid != candidateGrid) {
+                    throw new BridgeError(409, "ambiguous_me_node", "Several ME networks are exposed here; specify the side");
+                }
+                if (selected == null || !selected.isActive()) {
+                    selected = candidate;
+                    selectedGrid = candidateGrid;
+                }
             }
-            throw failure;
+            return activeGrid(selected);
         }
     }
 
+    private static IGrid activeGrid(IGridNode node) {
+        IGrid grid = node == null ? null : node.getGrid();
+        if (grid == null || !node.isActive() || !grid.getEnergyService().isNetworkPowered()) {
+            throw new BridgeError(409, "me_offline", "No active powered ME node is available on the selected side");
+        }
+        return grid;
+    }
 }

@@ -70,7 +70,7 @@ async function registrations() {
   return (await Promise.all(ids.map(readRegistration))).filter(Boolean);
 }
 
-async function requestInstance(instance, operation, args, timeout = 7000) {
+async function requestInstance(instance, operation, args, timeout = operation === "build_gt_multiblock_from_me" ? 30000 : 7000) {
   let token;
   try {
     token = (await readFile(join(instance.configDirectory, "minecraft-automation-mcp-bridge.token"), "utf8")).trim();
@@ -170,21 +170,20 @@ const stateToken = z.string().regex(stateTokenPattern);
 const resourceId = z.string().min(1);
 const positiveAmount = z.number().int().positive().max(2147483647);
 const slotIndex = z.number().int().nonnegative();
-const chestSlotIndex = slotIndex.max(26);
 const meDirection = z.enum(["to_me", "from_me"]);
-const machineDirection = z.enum(["to_machine", "from_machine"]);
 const coordinate = z.number().int().min(-2147483648).max(2147483647);
 const blockLocation = {
   dimension: resourceId,
   position: z.object({ x: coordinate, y: coordinate, z: coordinate }),
 };
 const blockLocationObject = z.object(blockLocation);
-const testStates = z.enum([
-  "minecraft:air",
-  "minecraft:oak_log[axis=x]",
-  "minecraft:oak_log[axis=y]",
-  "minecraft:oak_log[axis=z]",
-]);
+const blockSide = z.enum(["down", "up", "north", "south", "west", "east"]);
+const sidedLocation = { ...blockLocation, side: blockSide.optional() };
+const sidedLocationObject = z.object(sidedLocation);
+const batchRequestId = z.string().regex(instanceIdPattern)
+  .describe("Use a new UUID for each batch. Keep it and all arguments unchanged to retrieve the same receipt after a timeout.");
+
+// 实例与世界
 
 server.registerTool("list_game_instances", {
   description: "Discover local Minecraft instances running the Forge bridge and read their instance IDs, game directories, and world status.",
@@ -195,6 +194,329 @@ registerReadTool("get_game_status", {
   description: "Check the running Forge bridge, current singleplayer world, and active cheat permissions.",
 });
 
+registerReadTool("get_block", {
+  description: "Read a block and its properties at a loaded coordinate in the given dimension.",
+  inputSchema: blockLocation,
+});
+
+registerTool("set_wandering_trader_spawning", {
+  description: "Set whether wandering traders can spawn in the specified loaded singleplayer save.",
+  inputSchema: {
+    expectedWorldFolder: z.string().min(1),
+    enabled: z.boolean(),
+  },
+  annotations: { destructiveHint: false, idempotentHint: true },
+});
+
+registerTool("set_overworld_chunks_to_plains", {
+  description: "Replace all biomes with plains in up to 64 full Overworld chunks in the specified loaded save. Chunk bounds are inclusive.",
+  inputSchema: {
+    expectedWorldFolder: z.string().min(1),
+    minChunkX: coordinate, maxChunkX: coordinate,
+    minChunkZ: coordinate, maxChunkZ: coordinate,
+  },
+  annotations: { destructiveHint: true, idempotentHint: true },
+});
+
+registerTool("place_block_from_me", {
+  description: "Place one untagged block item from ME into loaded empty space above solid floor, with no living entity in the target. Does not place covers.",
+  inputSchema: {
+    ...blockLocation, drive: sidedLocationObject, expectedWorldFolder: z.string().min(1),
+    item: resourceId, expectedSourceToken: stateToken,
+  },
+  annotations: { destructiveHint: false },
+});
+
+// 库存与搬运
+const batchMachine = z.object({ ...sidedLocation, kind: z.string().optional().describe("Legacy label. Forge determines item access.") });
+
+registerReadTool("get_container", {
+  description: "Read Forge item slots and source stack tokens, plus native machine status where available. Include side for a sided handler.",
+  inputSchema: sidedLocation,
+});
+
+registerTool("transfer_item", {
+  description: "Move an exact amount from a Forge item slot to another handler. Use the same source side as get_container and a fresh source token.",
+  inputSchema: {
+    source: sidedLocationObject,
+    target: sidedLocationObject,
+    sourceSlot: slotIndex,
+    targetSlot: slotIndex.optional(),
+    amount: positiveAmount,
+    expectedStackToken: stateToken,
+  },
+  annotations: { destructiveHint: true },
+});
+
+registerReadTool("get_tank", {
+  description: "Read a block's Forge fluid handler. Returns compartments, capacities and exact fluid variant tokens. Supply side for a sided handler.",
+  inputSchema: sidedLocation,
+});
+
+registerTool("transfer_fluid", {
+  description: "Move the exact amount in mB between two Forge fluid handlers. Use the source fluid token from get_tank on the same side. The receiving handler chooses the compartment.",
+  inputSchema: {
+    source: sidedLocationObject,
+    target: sidedLocationObject,
+    amount: positiveAmount,
+    expectedFluidToken: stateToken,
+  },
+  annotations: { destructiveHint: true },
+});
+
+registerReadTool("get_me_item", {
+  description: "Read the count and variant tokens for one item in an active AE2 network, using an AE2 node as the location.",
+  inputSchema: { ...sidedLocation, item: resourceId },
+});
+
+registerTool("transfer_me_item", {
+  description: "Move items between a Forge item handler and powered ME. Use container (chest is a legacy alias), the matching side, and a fresh source token.",
+  inputSchema: {
+    container: sidedLocationObject.optional(),
+    chest: sidedLocationObject.optional(),
+    drive: sidedLocationObject,
+    direction: meDirection,
+    item: resourceId,
+    amount: positiveAmount,
+    sourceSlot: slotIndex.optional(),
+    targetSlot: slotIndex.optional(),
+    expectedSourceToken: stateToken,
+  },
+  annotations: { destructiveHint: true },
+});
+
+registerReadTool("get_me_machine_snapshot", {
+  description: "Read ME items and Forge item slots for a list of machines or containers in one snapshot. Returns source tokens. Supply an AE2 node as drive when querying ME items.",
+  inputSchema: {
+    drive: sidedLocationObject.optional(),
+    items: z.array(resourceId).min(1).max(128).optional(),
+    machines: z.array(batchMachine).min(1).max(32).optional(),
+  },
+});
+
+registerTool("transfer_me_machine_batch", {
+  description: "Run ordered ME item transfers to or from Forge item slots at specified positions and sides. Use fresh source tokens from get_me_machine_snapshot. Returns actual moved amounts and per-step errors.",
+  inputSchema: {
+    drive: sidedLocationObject,
+    expectedWorldFolder: z.string().min(1),
+    requestId: batchRequestId,
+    transfers: z.array(z.object({
+      machine: batchMachine,
+      direction: z.enum(["to_machine", "from_machine"]),
+      slot: slotIndex,
+      item: resourceId,
+      amount: positiveAmount,
+      expectedSourceToken: stateToken,
+    })).min(1).max(32),
+  },
+  annotations: { destructiveHint: true, idempotentHint: true },
+});
+
+registerReadTool("get_me_fluid", {
+  description: "Read a fluid's amount in an active AE2 network, located by an AE2 node, in mB.",
+  inputSchema: { ...sidedLocation, fluid: resourceId },
+});
+
+registerTool("transfer_me_fluid", {
+  description: "Move fluid between a Forge fluid handler and powered ME. Use the source variant token from get_tank on the same side, or get_me_fluid. AE2 may apply a deposit to a waiting order. moved reports the actual amount accepted in mB.",
+  inputSchema: {
+    tank: sidedLocationObject,
+    drive: sidedLocationObject,
+    direction: meDirection,
+    fluid: resourceId,
+    amount: positiveAmount,
+    expectedSourceToken: stateToken,
+  },
+  annotations: { destructiveHint: true },
+});
+
+registerTool("fill_me_fluid_bucket", {
+  description: "Fill one empty vanilla bucket from 1000 mB of an exact fluid variant in a powered ME network and store the result in ME. Read fresh tokens with get_me_item for minecraft:bucket and get_me_fluid.",
+  inputSchema: {
+    drive: sidedLocationObject,
+    fluid: resourceId,
+    expectedFluidToken: stateToken,
+    expectedBucketToken: stateToken,
+    expectedWorldFolder: z.string().min(1),
+  },
+  annotations: { destructiveHint: true },
+});
+
+registerReadTool("get_host_inventory", {
+  description: "Read the singleplayer host's main inventory slots and source tokens for item transfers, including FTB rewards.",
+});
+
+registerTool("transfer_host_me_item", {
+  description: "Move a matching stack between the host's specified main inventory slot and ME. Pass a fresh inventory token for to_me or ME variant token for from_me.",
+  inputSchema: {
+    drive: sidedLocationObject, expectedWorldFolder: z.string().min(1),
+    slot: slotIndex.max(35), item: resourceId, amount: positiveAmount, direction: meDirection,
+    expectedSourceToken: stateToken,
+  },
+  annotations: { destructiveHint: false },
+});
+
+// AE2 与工作台合成
+const workbenchGrid = z.array(z.object({ item: resourceId, expectedSourceToken: stateToken }).nullable()).length(9);
+const patternProviderLocation = {
+  ...sidedLocation,
+  provider: z.object({ position: blockLocation.position, side: blockSide.optional() }),
+  slot: slotIndex,
+};
+const processingItem = z.object({
+  item: resourceId,
+  amount: positiveAmount,
+  meToken: stateToken.optional(),
+});
+const orderId = z.string().uuid();
+
+registerReadTool("find_workbench_recipes", {
+  description: "Find actual workbench recipes registered in the loaded pack by their output item ID.",
+  inputSchema: { item: resourceId },
+});
+
+registerReadTool("get_workbench_recipe", {
+  description: "Read a registered workbench recipe, its output, and accepted ingredient examples.",
+  inputSchema: { recipe: resourceId },
+});
+
+registerTool("craft_from_me", {
+  description: "Perform one registered workbench craft with items from a powered AE2 network. Use nine row-major slots, each null or an item and its ME variant token. Result and remainders return to ME.",
+  inputSchema: {
+    ...sidedLocation,
+    recipe: resourceId,
+    grid: workbenchGrid,
+  },
+  annotations: { destructiveHint: true },
+});
+
+registerTool("craft_batch_from_me", {
+  description: "Repeat one registered workbench recipe from ME storage without AE2 crafting automation. Use fresh variant tokens and nine row-major slots. Returns the completed crafts and stops at the first blocked craft.",
+  inputSchema: {
+    ...sidedLocation,
+    expectedWorldFolder: z.string().min(1),
+    requestId: batchRequestId,
+    recipe: resourceId,
+    repetitions: z.number().int().min(1).max(64),
+    grid: workbenchGrid,
+  },
+  annotations: { destructiveHint: true, idempotentHint: true },
+});
+
+registerTool("encode_me_crafting_pattern", {
+  description: "Consume one blank pattern from ME and encode a workbench recipe into an empty slot of a same-network AE2 pattern container. Give nine row-major ingredient slots. Supply an ME token for ingredients with variant data.",
+  inputSchema: {
+    ...patternProviderLocation,
+    recipe: resourceId,
+    grid: z.array(z.object({ item: resourceId, meToken: stateToken.optional() }).nullable()).length(9),
+  },
+  annotations: { destructiveHint: true, idempotentHint: true },
+});
+
+registerTool("encode_me_processing_pattern", {
+  description: "Consume one blank pattern from ME and install an AE2 processing pattern in a same-network AE2 pattern container. Supply item inputs and expected outputs for a connected machine.",
+  inputSchema: {
+    ...patternProviderLocation,
+    inputs: z.array(processingItem).min(1).max(9),
+    outputs: z.array(processingItem).min(1).max(3),
+  },
+  annotations: { destructiveHint: true, idempotentHint: true },
+});
+
+registerReadTool("get_me_craftable", {
+  description: "Find active AE2 crafting patterns for an item and return craftable variants and stored counts.",
+  inputSchema: { ...sidedLocation, item: resourceId },
+});
+
+registerTool("order_me_craft", {
+  description: "Queue an AE2 native crafting order. AE2 dispatches ingredients and receives products through the configured machine return path. After submission, poll get_me_craft_order for progress. Use a new UUID for each order and reuse it on retries within this world session.",
+  inputSchema: {
+    ...sidedLocation,
+    item: resourceId,
+    amount: positiveAmount,
+    orderId,
+    variant: stateToken.optional(),
+  },
+  annotations: { destructiveHint: true, idempotentHint: true },
+});
+
+registerReadTool("get_me_craft_order", {
+  description: "Read the current-session AE2 order state, ingredient shortages, native job ID, and observed ME stock.",
+  inputSchema: { orderId },
+});
+
+registerTool("cancel_me_craft_order", {
+  description: "Cancel a pending or running AE2 crafting order owned by this bridge session.",
+  inputSchema: { orderId },
+  annotations: { destructiveHint: true, idempotentHint: true },
+});
+
+// GTCEu 机器与多方块
+const multiblockParts = z.array(z.object({ offset: blockLocation.position, block: resourceId })).max(128).optional();
+const multiblockPreviewIndex = z.number().int().min(0).max(2147483647).optional();
+
+registerReadTool("find_gt_recipes", {
+  description: "Find recipes in the active pack by GT item or fluid output, optionally restricted to a GT recipe type.",
+  inputSchema: { item: resourceId.optional(), fluid: resourceId.optional(), recipeType: resourceId.optional() },
+});
+
+registerTool("configure_gt_machine", {
+  description: "Set a GT single-block machine's working mode and optionally its ghost circuit. Use -1 to clear the circuit.",
+  inputSchema: {
+    ...blockLocation,
+    workingEnabled: z.boolean().optional(),
+    circuit: z.number().int().min(-1).optional(),
+  },
+  annotations: { destructiveHint: true },
+});
+
+registerTool("install_gt_cover_from_me", {
+  description: "Install one GT cover item from ME on the chosen side of a block exposing GT cover access. GT checks compatibility and the side must be empty.",
+  inputSchema: {
+    ...blockLocation, side: blockSide, item: resourceId,
+    drive: sidedLocationObject, expectedWorldFolder: z.string().min(1), expectedSourceToken: stateToken,
+  },
+  annotations: { destructiveHint: false },
+});
+
+registerTool("service_gt_maintenance", {
+  description: "Use one real duct tape from ME to repair a GT maintenance hatch through GT's native repair API.",
+  inputSchema: {
+    hatch: blockLocationObject,
+    drive: sidedLocationObject,
+    expectedSourceToken: stateToken,
+  },
+  annotations: { destructiveHint: true },
+});
+
+registerReadTool("get_gt_multiblock_layout", {
+  description: "Read a native GTCEu multiblock preview and count its materials. Supply exactly one registered machine or controller block ID (structure), or a placed controller location. Offsets are relative to the controller in the preview orientation. Select previewIndex if several previews are registered. Optional parts are explicit planning substitutions.",
+  inputSchema: {
+    structure: resourceId.optional(),
+    controller: blockLocationObject.optional(),
+    previewIndex: multiblockPreviewIndex,
+    parts: multiblockParts,
+  },
+});
+
+registerTool("build_gt_multiblock_from_me", {
+  description: "Build a registered GT multiblock from ME at a loaded empty site using the same previewIndex and parts as get_gt_multiblock_layout. GT validates the resulting pattern.",
+  inputSchema: {
+    structure: resourceId, controller: blockLocationObject, drive: sidedLocationObject,
+    previewIndex: multiblockPreviewIndex, parts: multiblockParts,
+  },
+  annotations: { destructiveHint: true },
+});
+
+registerReadTool("check_multiblock_blocks", {
+  description: "Compare a blueprint's absolute positions with registered block IDs in the chosen dimension. Returns counts and only missing, incorrect or unavailable positions. Does not load chunks.",
+  inputSchema: {
+    dimension: resourceId,
+    blocks: z.array(z.object({ position: blockLocation.position, block: resourceId })).min(1).max(1024),
+  },
+});
+
+// FTB 任务
 const ftbId = z.string().regex(/^[0-9a-fA-F]{1,16}$/);
 const ftbPage = {
   offset: z.number().int().min(0).max(2147483647).optional(),
@@ -221,18 +543,42 @@ registerReadTool("get_ftb_quest", {
   inputSchema: { questId: ftbId },
 });
 
-registerReadTool("get_block", {
-  description: "Read a block and its properties at a loaded coordinate in the given dimension.",
-  inputSchema: blockLocation,
+registerTool("check_ftb_task", {
+  description: "Complete a checkmark task in the specified save using FTB's normal task rules. Get taskId from get_ftb_quest. Returns updated quest details.",
+  inputSchema: { expectedWorldFolder: z.string().min(1), taskId: ftbId },
+  annotations: { destructiveHint: false, idempotentHint: true },
 });
 
+registerTool("submit_ftb_item_from_me", {
+  description: "Submit an exact ME item stack to an unlocked resource-consuming FTB task using FTB's native item insertion.",
+  inputSchema: {
+    drive: sidedLocationObject,
+    taskId: ftbId,
+    item: resourceId,
+    amount: z.number().int().min(1).max(64),
+    expectedSourceToken: stateToken,
+    expectedWorldFolder: z.string().min(1),
+  },
+  annotations: { destructiveHint: true },
+});
+
+registerTool("claim_ftb_reward", {
+  description: "Claim one available FTB reward for the singleplayer host in the specified save. Get rewardId and any choiceIndex from get_ftb_quest. Returns updated quest details.",
+  inputSchema: { expectedWorldFolder: z.string().min(1), rewardId: ftbId, choiceIndex: slotIndex.max(2147483647).optional() },
+  annotations: { destructiveHint: false, idempotentHint: true },
+});
+
+// 树场与采收
+
 registerTool("start_tree_farm", {
-  description: "Start one repeating oak or birch farm at a dedicated planting position. Use separate single chests for saplings and logs, both in the planting dimension.",
+  description: "Start a repeating oak or birch farm. Supply and output use separate Forge item handlers in the planting dimension. Specify supplySide and outputSide for sided access.",
   inputSchema: {
     ...blockLocation,
     tree: z.enum(["oak", "birch"]),
     supply: blockLocation.position,
     output: blockLocation.position,
+    supplySide: blockSide.optional(),
+    outputSide: blockSide.optional(),
   },
   annotations: { destructiveHint: true, idempotentHint: true },
 });
@@ -246,26 +592,50 @@ registerTool("stop_tree_farm", {
   annotations: { destructiveHint: false, idempotentHint: true },
 });
 
-registerTool("verify_tree_farm", {
-  description: "Run one harvest and replant check using temporary blocks, then restore the site. Requires allowTestFixtures and a configured test target.",
-  annotations: { destructiveHint: true },
+registerTool("start_me_spruce_farm", {
+  description: "Start a repeating 2x2 giant spruce farm at the northwest sapling position. A new plot uses four dirt and four spruce saplings from ME above a solid floor. Logs and canopy drops return to ME.",
+  inputSchema: { ...blockLocation, drive: sidedLocationObject, expectedWorldFolder: z.string().min(1) },
+  annotations: { destructiveHint: true, idempotentHint: true },
+});
+
+registerReadTool("get_me_spruce_farm_status", {
+  description: "Read the running ME spruce farm, stored drops, recovered loose drops, and any reason it is blocked.",
+});
+
+registerTool("stop_me_spruce_farm", {
+  description: "Stop the repeating ME spruce farm and leave the soil and tree in place.",
+  annotations: { destructiveHint: false, idempotentHint: true },
 });
 
 registerReadTool("find_spruce_and_me", {
-  description: "Find giant spruce trunk bases and ME Drives near a position in loaded chunks.",
+  description: "Find giant spruce trunk bases and active AE2 network endpoints near a position in loaded chunks.",
   inputSchema: { ...blockLocation, radius: z.number().int().min(1).max(48).optional() },
 });
 
 registerReadTool("inspect_giant_spruce", {
-  description: "Check the northwest corner of a giant spruce and the ME Drive for a harvest and 2x2 replant.",
-  inputSchema: { ...blockLocation, drive: blockLocationObject },
+  description: "Check the northwest corner of a giant spruce and the ME network for a harvest and 2x2 replant.",
+  inputSchema: { ...blockLocation, drive: sidedLocationObject },
 });
 
 registerTool("harvest_giant_spruce_to_me", {
   description: "Harvest an inspected giant spruce into ME and replant four saplings at its 2x2 base.",
-  inputSchema: { ...blockLocation, drive: blockLocationObject, expectedPlan: stateToken },
+  inputSchema: { ...blockLocation, drive: sidedLocationObject, expectedPlan: stateToken },
   annotations: { destructiveHint: true },
 });
+
+registerTool("harvest_rubber_trunk_to_me", {
+  description: "Harvest the natural rubber tree trunk above a soil block and store its actual loot in ME. Inspect the base before use.",
+  inputSchema: { ...blockLocation, drive: sidedLocationObject, expectedWorldFolder: z.string().min(1) },
+  annotations: { destructiveHint: true },
+});
+
+// 测试夹具
+const testStates = z.enum([
+  "minecraft:air",
+  "minecraft:oak_log[axis=x]",
+  "minecraft:oak_log[axis=y]",
+  "minecraft:oak_log[axis=z]",
+]);
 
 registerTool("set_test_block", {
   description: "Change the configured test coordinate between air and an oriented oak log when the current state matches expected. Requires allowTestBlockWrites.",
@@ -273,254 +643,9 @@ registerTool("set_test_block", {
   annotations: { destructiveHint: true },
 });
 
-registerReadTool("get_container", {
-  description: "Read a single vanilla chest. Each occupied slot includes a stack token for a checked transfer.",
-  inputSchema: blockLocation,
-});
-
-registerTool("transfer_item", {
-  description: "Move the exact amount from one slot of a single vanilla chest into another. If there is not enough room, move nothing.",
-  inputSchema: {
-    source: blockLocationObject,
-    target: blockLocationObject,
-    sourceSlot: chestSlotIndex,
-    amount: positiveAmount,
-    expectedStackToken: stateToken,
-  },
+registerTool("verify_tree_farm", {
+  description: "Run one harvest and replant check using temporary blocks, then restore the site. Requires allowTestFixtures and a configured test target.",
   annotations: { destructiveHint: true },
-});
-
-registerReadTool("get_tank", {
-  description: "Read a GT bronze drum, including fluid, amount and capacity in mB. Use its fluid token for a checked transfer.",
-  inputSchema: blockLocation,
-});
-
-registerTool("transfer_fluid", {
-  description: "Move the exact amount in mB between two GT bronze drums. If the target cannot hold it, move nothing.",
-  inputSchema: {
-    source: blockLocationObject,
-    target: blockLocationObject,
-    amount: positiveAmount,
-    expectedFluidToken: stateToken,
-  },
-  annotations: { destructiveHint: true },
-});
-
-registerReadTool("get_me_item", {
-  description: "Read the count and variant tokens for one item in an active AE2 network, using an ME Drive as the location.",
-  inputSchema: { ...blockLocation, item: resourceId },
-});
-
-registerTool("transfer_me_item", {
-  description: "Manually move items between a single vanilla chest and a powered ME network. For to_me, pass the source slot and chest stack token. For from_me, pass a fresh ME variant token. AE2 may apply a deposit to a waiting order. moved reports the actual amount accepted.",
-  inputSchema: {
-    chest: blockLocationObject,
-    drive: blockLocationObject,
-    direction: meDirection,
-    item: resourceId,
-    amount: positiveAmount,
-    sourceSlot: chestSlotIndex.optional(),
-    expectedSourceToken: stateToken,
-  },
-  annotations: { destructiveHint: true },
-});
-
-registerReadTool("get_me_fluid", {
-  description: "Read a fluid's amount in an active AE2 network from an ME Drive, in mB.",
-  inputSchema: { ...blockLocation, fluid: resourceId },
-});
-
-registerTool("transfer_me_fluid", {
-  description: "Manually move fluid between a GT bronze drum and powered ME. Use the source tank or ME fluid variant token. AE2 may apply a deposit to a waiting order. moved reports the actual amount accepted in mB.",
-  inputSchema: {
-    tank: blockLocationObject,
-    drive: blockLocationObject,
-    direction: meDirection,
-    fluid: resourceId,
-    amount: positiveAmount,
-    expectedSourceToken: stateToken,
-  },
-  annotations: { destructiveHint: true },
-});
-
-registerReadTool("get_gt_machine", {
-  description: "Read a GT machine's item and fluid slots, recipe progress, energy and voltage, or check multiblock formation.",
-  inputSchema: blockLocation,
-});
-
-registerTool("configure_gt_machine", {
-  description: "Set a GT single-block machine's working mode and optionally its ghost circuit. Use -1 to clear the circuit.",
-  inputSchema: {
-    ...blockLocation,
-    workingEnabled: z.boolean().optional(),
-    circuit: z.number().int().min(-1).optional(),
-  },
-  annotations: { destructiveHint: true },
-});
-
-const gtItemTransfer = {
-  item: resourceId,
-  amount: z.number().int().positive().max(64),
-  expectedSourceToken: stateToken,
-};
-
-registerTool("transfer_gt_me_item", {
-  description: "Manually move items between a powered AE2 network and one GT item slot for standalone operation or diagnostics. Use the source token. AE2 may apply a deposit to a waiting order. moved reports the actual amount accepted. Use the configured native return path for automatic orders.",
-  inputSchema: {
-    ...gtItemTransfer,
-    machine: blockLocationObject,
-    drive: blockLocationObject,
-    direction: machineDirection,
-    machineSlot: slotIndex,
-  },
-  annotations: { destructiveHint: true },
-});
-
-registerTool("transfer_gt_machine_item", {
-  description: "Move an exact stack from a GT machine output slot to the input slot of another GT machine.",
-  inputSchema: {
-    ...gtItemTransfer,
-    source: blockLocationObject,
-    target: blockLocationObject,
-    sourceSlot: slotIndex,
-    targetSlot: slotIndex,
-  },
-  annotations: { destructiveHint: true },
-});
-
-registerReadTool("get_gt_coke_oven_layout", {
-  description: "Read the GT Coke Oven structure, relative to its controller, and count the required ME materials.",
-});
-
-registerTool("build_gt_coke_oven_from_me", {
-  description: "Consume a GT Coke Oven's actual components from ME to build it at an empty loaded controller position, then validate the GT pattern.",
-  inputSchema: { controller: blockLocationObject, drive: blockLocationObject },
-  annotations: { destructiveHint: true },
-});
-
-registerTool("transfer_gt_me_fluid", {
-  description: "Manually move fluid between a powered AE2 network and a supported GT machine fluid slot for standalone operation or diagnostics. AE2 may apply a deposit to a waiting order. moved reports the actual amount accepted in mB.",
-  inputSchema: {
-    machine: blockLocationObject,
-    drive: blockLocationObject,
-    direction: machineDirection,
-    fluid: resourceId,
-    amount: positiveAmount,
-    machineTank: slotIndex,
-    expectedSourceToken: stateToken,
-  },
-  annotations: { destructiveHint: true },
-});
-
-const gtMultiblock = z.enum([
-  "gtceu:coke_oven",
-  "gtceu:electric_blast_furnace",
-  "gtceu:large_chemical_reactor",
-  "gtceu:pyrolyse_oven",
-]);
-
-registerReadTool("get_gt_multiblock_layout", {
-  description: "Read the validated GT layout and the ME material list for a supported multiblock.",
-  inputSchema: { structure: gtMultiblock },
-});
-
-registerTool("build_gt_multiblock_from_me", {
-  description: "Consume the actual structure materials from ME and build a supported GT multiblock at a loaded empty site.",
-  inputSchema: { structure: gtMultiblock, controller: blockLocationObject, drive: blockLocationObject },
-  annotations: { destructiveHint: true },
-});
-
-registerTool("service_gt_maintenance", {
-  description: "Use one real duct tape from ME to repair a GT maintenance hatch through GT's native repair API.",
-  inputSchema: {
-    hatch: blockLocationObject,
-    drive: blockLocationObject,
-    expectedSourceToken: stateToken,
-  },
-  annotations: { destructiveHint: true },
-});
-
-registerReadTool("get_workbench_recipe", {
-  description: "Read a registered workbench recipe, its output, and accepted ingredient examples.",
-  inputSchema: { recipe: resourceId },
-});
-
-registerReadTool("find_workbench_recipes", {
-  description: "Find actual workbench recipes registered in the loaded pack by their output item ID.",
-  inputSchema: { item: resourceId },
-});
-
-registerTool("craft_from_me", {
-  description: "Perform one registered workbench craft with items from a powered AE2 network. Use nine row-major slots, each null or an item and its ME variant token. Result and remainders return to ME.",
-  inputSchema: {
-    ...blockLocation,
-    recipe: resourceId,
-    grid: z.array(z.object({
-      item: resourceId,
-      expectedSourceToken: stateToken,
-    }).nullable()).length(9),
-  },
-  annotations: { destructiveHint: true },
-});
-
-const orderId = z.string().uuid();
-const patternProviderLocation = {
-  ...blockLocation,
-  provider: z.object({ position: blockLocation.position }),
-  slot: slotIndex,
-};
-
-registerTool("encode_me_crafting_pattern", {
-  description: "Consume one blank pattern from ME and encode a workbench recipe into an empty slot of a same-network AE2 pattern provider. Give nine row-major ingredient slots. Supply an ME token for ingredients with variant data.",
-  inputSchema: {
-    ...patternProviderLocation,
-    recipe: resourceId,
-    grid: z.array(z.object({ item: resourceId, meToken: stateToken.optional() }).nullable()).length(9),
-  },
-  annotations: { destructiveHint: true, idempotentHint: true },
-});
-
-registerReadTool("get_me_craftable", {
-  description: "Find active AE2 crafting patterns for an item and return craftable variants and stored counts.",
-  inputSchema: { ...blockLocation, item: resourceId },
-});
-
-const processingItem = z.object({
-  item: resourceId,
-  amount: positiveAmount,
-  meToken: stateToken.optional(),
-});
-registerTool("encode_me_processing_pattern", {
-  description: "Consume one blank pattern from ME and install an AE2 processing pattern in a same-network pattern provider or GT ME pattern buffer. Supply item inputs and expected outputs for a connected machine.",
-  inputSchema: {
-    ...patternProviderLocation,
-    inputs: z.array(processingItem).min(1).max(9),
-    outputs: z.array(processingItem).min(1).max(3),
-  },
-  annotations: { destructiveHint: true, idempotentHint: true },
-});
-
-registerTool("order_me_craft", {
-  description: "Queue an AE2 native crafting order. AE2 dispatches ingredients and receives products through the configured machine return path. After submission, poll get_me_craft_order for progress. Use a new UUID for each order and reuse it on retries within this world session.",
-  inputSchema: {
-    ...blockLocation,
-    item: resourceId,
-    amount: positiveAmount,
-    orderId,
-    variant: stateToken.optional(),
-  },
-  annotations: { destructiveHint: true, idempotentHint: true },
-});
-
-registerReadTool("get_me_craft_order", {
-  description: "Read the current-session AE2 order state, ingredient shortages, native job ID, and observed ME stock.",
-  inputSchema: { orderId },
-});
-
-registerTool("cancel_me_craft_order", {
-  description: "Cancel a pending or running AE2 crafting order owned by this bridge session.",
-  inputSchema: { orderId },
-  annotations: { destructiveHint: true, idempotentHint: true },
 });
 
 await server.connect(new StdioServerTransport());

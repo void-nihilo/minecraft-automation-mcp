@@ -4,18 +4,19 @@ import appeng.api.config.Actionable;
 import appeng.api.stacks.AEItemKey;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
-import com.gregtechceu.gtceu.api.GTValues;
 import com.gregtechceu.gtceu.api.block.IMachineBlock;
 import com.gregtechceu.gtceu.api.machine.MetaMachine;
 import com.gregtechceu.gtceu.api.machine.MultiblockMachineDefinition;
 import com.gregtechceu.gtceu.api.machine.multiblock.MultiblockControllerMachine;
-import com.gregtechceu.gtceu.common.data.GTMachines;
+import com.gregtechceu.gtceu.api.pattern.MultiblockShapeInfo;
+import com.gregtechceu.gtceu.api.registry.GTRegistries;
 import com.lowdragmc.lowdraglib.utils.BlockInfo;
 import minecraft.automation.mcp.MinecraftAutomationBridge.BridgeError;
 import net.minecraft.core.BlockPos;
-import net.minecraft.core.Direction;
+import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.item.Items;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
@@ -30,23 +31,92 @@ import java.util.Map;
 final class GtMultiblockOperations {
     private GtMultiblockOperations() {}
 
-    static JsonObject layout(String kind) {
-        var shape = shape(kind);
-        JsonArray cells = new JsonArray();
-        for (Placement placement : shape) {
-            JsonObject cell = new JsonObject();
-            cell.add("offset", MinecraftAutomationBridge.positionJson(placement.offset));
-            cell.addProperty("block", ForgeRegistries.BLOCKS.getKey(placement.state.getBlock()).toString());
-            cells.add(cell);
+    static JsonObject layout(ResourceLocation id, int previewIndex, Map<BlockPos, ResourceLocation> parts) {
+        return layout(registeredMultiblock(id), previewIndex, parts);
+    }
+
+    private static MultiblockMachineDefinition registeredMultiblock(ResourceLocation id) {
+        if (GTRegistries.MACHINES.get(id) instanceof MultiblockMachineDefinition definition) {
+            return definition;
         }
-        JsonObject result = materials(shape, kind);
+        Block block = ForgeRegistries.BLOCKS.getValue(id);
+        if (block instanceof IMachineBlock machine && machine.getDefinition() instanceof MultiblockMachineDefinition definition) {
+            return definition;
+        }
+        throw new BridgeError(404, "unknown_multiblock", "No registered GT multiblock for " + id);
+    }
+
+    static JsonObject layout(ServerLevel level, BlockPos position, int previewIndex,
+                             Map<BlockPos, ResourceLocation> parts) {
+        BlockState state = level.getBlockState(position);
+        if (!(state.getBlock() instanceof IMachineBlock machine)
+                || !(machine.getDefinition() instanceof MultiblockMachineDefinition definition)) {
+            throw new BridgeError(409, "not_multiblock_controller", "The position must contain a GT multiblock controller");
+        }
+        JsonObject result = layout(definition, previewIndex, parts);
+        var facing = machine.getRotationState().property;
+        if (state.hasProperty(facing)) {
+            result.addProperty("controllerFacing", state.getValue(facing).getSerializedName());
+        }
+        return result;
+    }
+
+    private static JsonObject layout(MultiblockMachineDefinition definition, int previewIndex,
+                                     Map<BlockPos, ResourceLocation> parts) {
+        var previews = definition.getMatchingShapes();
+        var shape = withParts(previewPlacements(definition, previews, previewIndex), parts);
+        var materialCounts = new LinkedHashMap<ResourceLocation, Integer>();
+        var blocksWithoutItem = new LinkedHashMap<ResourceLocation, Integer>();
+        JsonArray cells = new JsonArray();
+        JsonObject result = new JsonObject();
+        for (Placement placement : shape) {
+            BlockPos offset = placement.offset;
+            BlockState state = placement.state;
+            Block block = state.getBlock();
+            ResourceLocation blockId = ForgeRegistries.BLOCKS.getKey(block);
+            JsonObject cell = new JsonObject();
+            cell.add("offset", MinecraftAutomationBridge.positionJson(offset));
+            cell.addProperty("block", blockId.toString());
+            cells.add(cell);
+            if (offset.equals(BlockPos.ZERO) && block instanceof IMachineBlock machine) {
+                var facing = machine.getRotationState().property;
+                if (state.hasProperty(facing)) {
+                    result.addProperty("previewFacing", state.getValue(facing).getSerializedName());
+                }
+            }
+            if (!state.isAir()) {
+                var item = block.asItem();
+                if (item == Items.AIR) {
+                    blocksWithoutItem.merge(blockId, 1, Integer::sum);
+                } else {
+                    materialCounts.merge(ForgeRegistries.ITEMS.getKey(item), 1, Integer::sum);
+                }
+            }
+        }
+        result.addProperty("structure", definition.getId().toString());
+        result.addProperty("controllerBlock", ForgeRegistries.BLOCKS.getKey(definition.getBlock()).toString());
+        result.addProperty("previewCount", previews.size());
+        result.addProperty("previewIndex", previewIndex);
+        result.addProperty("customized", !parts.isEmpty());
+        result.add("materials", countsJson(materialCounts));
+        if (!blocksWithoutItem.isEmpty()) {
+            result.add("blocksWithoutItem", countsJson(blocksWithoutItem));
+        }
         result.add("layout", cells);
         return result;
     }
 
+    private static JsonObject countsJson(Map<ResourceLocation, Integer> counts) {
+        JsonObject result = new JsonObject();
+        counts.forEach((id, count) -> result.addProperty(id.toString(), count));
+        return result;
+    }
+
     static JsonObject build(ServerLevel level, BlockPos controllerPosition,
-                            ServerLevel driveLevel, BlockPos drive, String kind) {
-        var shape = shape(kind);
+                            MeOperations.Endpoint endpoint, ResourceLocation id,
+                            int previewIndex, Map<BlockPos, ResourceLocation> parts) {
+        var definition = registeredMultiblock(id);
+        var shape = withParts(previewPlacements(definition, definition.getMatchingShapes(), previewIndex), parts);
         for (Placement placement : shape) {
             BlockPos at = controllerPosition.offset(placement.offset);
             if (!level.isInWorldBounds(at) || !level.hasChunkAt(at)
@@ -55,9 +125,9 @@ final class GtMultiblockOperations {
                 throw new BridgeError(409, "build_site_unavailable", "The GT multiblock site must be empty and fully loaded: " + at);
             }
         }
-        var grid = MeOperations.gridAt(driveLevel, drive);
+        var grid = endpoint.grid();
         var storage = grid.getStorageService().getInventory();
-        var actor = MeOperations.playerAction(driveLevel);
+        var actor = MeOperations.playerAction(endpoint.level());
         var materials = materialCounts(shape);
         Map<AEItemKey, Long> balances = new LinkedHashMap<>();
         for (var entry : materials.entrySet()) {
@@ -93,7 +163,8 @@ final class GtMultiblockOperations {
                     || !controller.checkPatternWithLock()) {
                 throw new BridgeError(409, "pattern_mismatch", "GT rejected the placed multiblock pattern");
             }
-            JsonObject result = materials(shape, kind);
+            JsonObject result = materials(materials, definition.getId());
+            result.addProperty("previewIndex", previewIndex);
             result.addProperty("placed", placed.size());
             result.addProperty("patternValid", true);
             result.add("controller", MinecraftAutomationBridge.positionJson(controllerPosition));
@@ -120,80 +191,105 @@ final class GtMultiblockOperations {
         }
     }
 
-    static JsonObject prepareTestMaterials(ServerLevel level, BlockPos drive, String kind) {
-        var shape = shape(kind);
-        GtProductionTestFixtures.prepareStock(level, drive, materialCounts(shape),
-                "ME did not accept the test material ");
-        return materials(shape, kind);
-    }
-
-    private static List<Placement> shape(String kind) {
-        MultiblockMachineDefinition definition = switch (kind) {
-            case "gtceu:coke_oven" -> GTMachines.COKE_OVEN;
-            case "gtceu:electric_blast_furnace" -> GTMachines.ELECTRIC_BLAST_FURNACE;
-            case "gtceu:large_chemical_reactor" -> GTMachines.LARGE_CHEMICAL_REACTOR;
-            case "gtceu:pyrolyse_oven" -> GTMachines.PYROLYSE_OVEN;
-            default -> throw new BridgeError(400, "unknown_multiblock", "Unsupported GT multiblock: " + kind);
-        };
-        BlockInfo[][][] blocks = definition.getMatchingShapes().get(0).getBlocks();
+    private static List<Placement> previewPlacements(MultiblockMachineDefinition definition,
+                                                      List<MultiblockShapeInfo> previews, int previewIndex) {
+        if (previews.isEmpty()) {
+            throw new BridgeError(409, "pattern_unavailable", "The GT multiblock has no registered preview");
+        }
+        if (previewIndex < 0 || previewIndex >= previews.size()) {
+            throw new BridgeError(400, "invalid_preview_index", "Choose a preview index from 0 to " + (previews.size() - 1));
+        }
+        BlockInfo[][][] blocks = previews.get(previewIndex).getBlocks();
         Block controller = definition.getBlock();
         BlockPos anchor = null;
+        BlockState controllerState = null;
         List<Placement> cells = new ArrayList<>();
         for (int x = 0; x < blocks.length; x++) {
             for (int y = 0; y < blocks[x].length; y++) {
                 for (int z = 0; z < blocks[x][y].length; z++) {
                     BlockInfo block = blocks[x][y][z];
                     BlockState state = block == null ? Blocks.AIR.defaultBlockState() : block.getBlockState();
-                    if (definition == GTMachines.PYROLYSE_OVEN
-                            && state.is(GTMachines.ENERGY_INPUT_HATCH[GTValues.LV].getBlock())) {
-                        Block hatch = GTMachines.ENERGY_INPUT_HATCH_16A[GTValues.EV].getBlock();
-                        state = hatch.defaultBlockState().setValue(((IMachineBlock) hatch).getRotationState().property, Direction.SOUTH);
-                    }
                     BlockPos offset = new BlockPos(x, y, z);
                     if (state.is(controller)) {
+                        if (anchor != null) {
+                            throw new BridgeError(409, "ambiguous_preview_controller", "The GT preview contains multiple controller blocks");
+                        }
                         anchor = offset;
+                        controllerState = state;
+                    } else {
+                        cells.add(new Placement(offset, state));
                     }
-                    cells.add(new Placement(offset, state));
                 }
             }
         }
         if (anchor == null) {
             throw new BridgeError(409, "pattern_unavailable", "The GT multiblock preview has no controller");
         }
-        List<Placement> result = new ArrayList<>();
+        List<Placement> result = new ArrayList<>(cells.size() + 1);
         for (Placement cell : cells) {
-            if (!cell.state.is(controller)) {
-                result.add(new Placement(cell.offset.subtract(anchor), cell.state));
-            }
+            result.add(new Placement(cell.offset.subtract(anchor), cell.state));
         }
-        result.add(new Placement(BlockPos.ZERO, controllerState(cells, controller)));
+        result.add(new Placement(BlockPos.ZERO, controllerState));
         return result;
     }
 
-    private static BlockState controllerState(List<Placement> cells, Block controller) {
-        return cells.stream().map(Placement::state).filter(state -> state.is(controller))
-                .findFirst().orElseThrow();
+    private static List<Placement> withParts(List<Placement> shape, Map<BlockPos, ResourceLocation> parts) {
+        if (parts.isEmpty()) {
+            return shape;
+        }
+        var pending = new LinkedHashMap<>(parts);
+        var result = new ArrayList<Placement>(shape.size());
+        for (Placement original : shape) {
+            ResourceLocation id = pending.remove(original.offset);
+            if (id == null) {
+                result.add(original);
+                continue;
+            }
+            if (original.offset.equals(BlockPos.ZERO) || original.state.isAir()) {
+                throw new BridgeError(400, "invalid_part_offset", "Choose a non-air preview position other than the controller");
+            }
+            if (!ForgeRegistries.BLOCKS.containsKey(id)) {
+                throw new BridgeError(400, "unknown_part", "No registered block for " + id);
+            }
+            Block replacement = ForgeRegistries.BLOCKS.getValue(id);
+            BlockState target = replacement.defaultBlockState();
+            if (target.isAir()) {
+                throw new BridgeError(400, "invalid_part", "A replacement must be a non-air block");
+            }
+            if (replacement instanceof IMachineBlock machine) {
+                var facing = machine.getRotationState().property;
+                if (target.hasProperty(facing) && original.state.hasProperty(facing)) {
+                    target = target.setValue(facing, original.state.getValue(facing));
+                }
+            }
+            result.add(new Placement(original.offset, target));
+        }
+        if (!pending.isEmpty()) {
+            throw new BridgeError(400, "invalid_part_offset", "A part offset is outside the preview");
+        }
+        return result;
     }
 
     private static Map<AEItemKey, Integer> materialCounts(List<Placement> shape) {
         Map<AEItemKey, Integer> counts = new LinkedHashMap<>();
         for (Placement cell : shape) {
             if (!cell.state.isAir()) {
-                var key = AEItemKey.of(cell.state.getBlock().asItem());
-                if (key == null) {
-                    throw new BridgeError(409, "pattern_unavailable", "The preview includes a block without an item");
+                var item = cell.state.getBlock().asItem();
+                if (item == Items.AIR) {
+                    throw new BridgeError(409, "unavailable_build_material",
+                            "No inventory item for " + ForgeRegistries.BLOCKS.getKey(cell.state.getBlock()));
                 }
-                counts.merge(key, 1, Integer::sum);
+                counts.merge(AEItemKey.of(item), 1, Integer::sum);
             }
         }
         return counts;
     }
 
-    private static JsonObject materials(List<Placement> shape, String kind) {
+    private static JsonObject materials(Map<AEItemKey, Integer> materials, ResourceLocation kind) {
         JsonObject result = new JsonObject();
-        result.addProperty("structure", kind);
+        result.addProperty("structure", kind.toString());
         JsonObject list = new JsonObject();
-        materialCounts(shape).forEach((key, count) -> list.addProperty(key.getId().toString(), count));
+        materials.forEach((key, count) -> list.addProperty(key.getId().toString(), count));
         result.add("materials", list);
         return result;
     }

@@ -4,15 +4,19 @@ import appeng.api.config.Actionable;
 import appeng.api.crafting.IPatternDetails;
 import appeng.api.crafting.PatternDetailsHelper;
 import appeng.api.inventories.InternalInventory;
+import appeng.api.networking.GridHelper;
 import appeng.api.networking.IGrid;
+import appeng.api.networking.IGridNode;
 import appeng.api.networking.crafting.CalculationStrategy;
 import appeng.api.networking.crafting.ICraftingLink;
 import appeng.api.networking.crafting.ICraftingPlan;
 import appeng.api.networking.crafting.ICraftingProvider;
+import appeng.api.networking.security.IActionHost;
+import appeng.api.parts.IPart;
+import appeng.api.parts.IPartHost;
 import appeng.api.stacks.AEItemKey;
 import appeng.api.stacks.AEKey;
 import appeng.api.stacks.GenericStack;
-import appeng.blockentity.crafting.PatternProviderBlockEntity;
 import appeng.core.definitions.AEItems;
 import appeng.crafting.CraftingLink;
 import appeng.crafting.CraftingLinkNexus;
@@ -22,9 +26,9 @@ import com.google.common.hash.Hashing;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.gregtechceu.gtceu.api.machine.MetaMachine;
-import com.gregtechceu.gtceu.integration.ae2.machine.feature.IGridConnectedMachine;
 import minecraft.automation.mcp.MinecraftAutomationBridge.BridgeError;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.item.ItemStack;
@@ -35,20 +39,21 @@ import net.minecraftforge.registries.ForgeRegistries;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
-import java.util.function.Predicate;
 
 final class MeCraftingOperations {
     private final Map<UUID, Order> orders = new HashMap<>();
     private final Map<UUID, Future<ICraftingPlan>> calculations = new LinkedHashMap<>();
 
-    static JsonObject installPattern(ServerLevel level, BlockPos drive, BlockPos providerPosition,
+    static JsonObject installPattern(MeOperations.Endpoint endpoint, BlockPos providerPosition, Direction providerSide,
                                      int slot, ResourceLocation recipe, JsonArray requestedGrid) {
-        IGrid grid = MeOperations.gridAt(level, drive);
+        ServerLevel level = endpoint.level();
+        IGrid grid = endpoint.grid();
         if (requestedGrid.size() != 9) {
             throw new IllegalArgumentException("Supply nine recipe slots");
         }
@@ -71,17 +76,18 @@ final class MeCraftingOperations {
             }
         }
 
-        var provider = providerAt(level, providerPosition, grid, false);
+        var provider = providerAt(level, providerPosition, providerSide, grid);
         var encoded = MeWorkbenchOperations.encodePattern(level, recipe, inputs);
         JsonObject result = installEncodedPattern(level, grid, provider, slot, encoded);
         result.addProperty("recipe", recipe.toString());
         return result;
     }
 
-    static JsonObject installProcessingPattern(ServerLevel level, BlockPos drive, BlockPos providerPosition,
+    static JsonObject installProcessingPattern(MeOperations.Endpoint endpoint, BlockPos providerPosition, Direction providerSide,
                                                int slot, JsonArray inputs, JsonArray outputs) {
-        IGrid grid = MeOperations.gridAt(level, drive);
-        var provider = providerAt(level, providerPosition, grid, true);
+        ServerLevel level = endpoint.level();
+        IGrid grid = endpoint.grid();
+        var provider = providerAt(level, providerPosition, providerSide, grid);
         var inventory = grid.getStorageService().getInventory().getAvailableStacks();
         var encoded = PatternDetailsHelper.encodeProcessingPattern(
                 processingItems(inputs, 9, inventory), processingItems(outputs, 3, inventory));
@@ -113,29 +119,71 @@ final class MeCraftingOperations {
         return stacks;
     }
 
-    private static PatternTarget providerAt(ServerLevel level, BlockPos position, IGrid grid, boolean processing) {
-        if (level.getBlockEntity(position) instanceof PatternProviderBlockEntity provider
-                && provider.getMainNode().isActive() && provider.getLogic().getGrid() == grid) {
-            var logic = provider.getLogic();
-            return new PatternTarget(logic.getPatternInv(), details -> logic.getAvailablePatterns().contains(details));
+    private static PatternTarget providerAt(ServerLevel level, BlockPos position, Direction side, IGrid grid) {
+        var candidates = new LinkedHashSet<PatternContainer>();
+        var entity = level.getBlockEntity(position);
+        if (entity instanceof PatternContainer container) {
+            candidates.add(container);
         }
-        if (processing && ModList.get().isLoaded("gtceu")) {
-            var machine = MetaMachine.getMachine(level, position);
-            if (machine instanceof PatternContainer container && machine instanceof ICraftingProvider provider
-                    && machine instanceof IGridConnectedMachine connected
-                    && connected.getMainNode().isActive() && container.getGrid() == grid) {
-                return new PatternTarget(container.getTerminalPatternInventory(), details ->
-                        provider.getAvailablePatterns().stream().anyMatch(pattern ->
-                                pattern.getDefinition().equals(details.getDefinition())
-                                        || pattern.getPrimaryOutput().equals(details.getPrimaryOutput())));
+        if (ModList.get().isLoaded("gtceu")
+                && MetaMachine.getMachine(level, position) instanceof PatternContainer container) {
+            candidates.add(container);
+        }
+        var nodeHost = GridHelper.getNodeHost(level, position);
+        for (Direction face : side == null ? Direction.values() : new Direction[] {side}) {
+            if (entity instanceof IPartHost parts && parts.getPart(face) instanceof PatternContainer container) {
+                candidates.add(container);
+            }
+            var node = nodeHost == null ? null : nodeHost.getGridNode(face);
+            if (node != null && node.getOwner() instanceof PatternContainer container) {
+                candidates.add(container);
             }
         }
-        throw new BridgeError(409, "provider_unavailable", processing
-                ? "Use an active AE2 pattern provider or GT ME pattern buffer on this ME network"
-                : "Use an active AE2 pattern provider block on this ME network");
+        PatternTarget selected = null;
+        for (PatternContainer container : candidates) {
+            if (container.getGrid() != grid) {
+                continue;
+            }
+            ICraftingProvider provider = craftingProvider(container, grid);
+            if (provider != null) {
+                if (selected != null) {
+                    throw new BridgeError(409, "ambiguous_provider", "Several pattern containers are available here; specify the provider side");
+                }
+                selected = new PatternTarget(container.getTerminalPatternInventory(), provider);
+            }
+        }
+        if (selected == null) {
+            throw new BridgeError(409, "provider_unavailable", "Use an active AE2 pattern container on this ME network");
+        }
+        return selected;
     }
 
-    private record PatternTarget(InternalInventory inventory, Predicate<IPatternDetails> registered) {}
+    private static ICraftingProvider craftingProvider(PatternContainer container, IGrid grid) {
+        IGridNode node = container instanceof IActionHost host ? host.getActionableNode()
+                : container instanceof IPart part ? part.getGridNode() : null;
+        if (node != null && node.getGrid() == grid && node.isActive()) {
+            ICraftingProvider provider = node.getService(ICraftingProvider.class);
+            if (provider != null) {
+                return provider;
+            }
+        }
+        for (IGridNode candidate : grid.getNodes()) {
+            if (candidate.getOwner() == container && candidate.isActive()) {
+                ICraftingProvider provider = candidate.getService(ICraftingProvider.class);
+                if (provider != null) {
+                    return provider;
+                }
+            }
+        }
+        return null;
+    }
+
+    private record PatternTarget(InternalInventory inventory, ICraftingProvider provider) {
+        boolean registered(IPatternDetails details) {
+            return provider.getAvailablePatterns().stream()
+                    .anyMatch(pattern -> pattern.getDefinition().equals(details.getDefinition()));
+        }
+    }
 
     private static JsonObject installEncodedPattern(ServerLevel level, IGrid grid, PatternTarget provider,
                                                      int slot, ItemStack encoded) {
@@ -149,34 +197,36 @@ final class MeCraftingOperations {
             throw new BridgeError(409, "invalid_pattern", "AE2 could not decode the encoded pattern");
         }
         ItemStack old = patterns.getStackInSlot(slot);
-        boolean alreadyInstalled = ItemStack.isSameItemSameTags(old, encoded);
+        boolean alreadyInstalled = ItemStack.matches(old, encoded);
         AEItemKey blank = AEItemKey.of(AEItems.BLANK_PATTERN.asItem());
         long blanksBefore = MeOperations.count(storage, blank);
-        if (!alreadyInstalled) {
-            if (!old.isEmpty() || !patterns.insertItem(slot, encoded, true).isEmpty()) {
+        if (alreadyInstalled) {
+            if (!provider.registered(details)) {
+                throw new BridgeError(409, "pattern_unregistered", "The installed stack is not registered by this provider");
+            }
+        } else {
+            if (!old.isEmpty() || !patterns.insertItem(slot, encoded.copy(), true).isEmpty()) {
                 throw new BridgeError(409, "provider_slot_unavailable", "Choose an empty pattern provider slot");
             }
             var actor = MeOperations.playerAction(level);
             if (MeOperations.mutateMe(grid, storage, actor, blank, 1, false, Actionable.SIMULATE) != 1) {
                 throw new BridgeError(409, "no_blank_pattern", "ME needs one blank pattern");
             }
-            try {
-                if (MeOperations.mutateMe(grid, storage, actor, blank, 1, false, Actionable.MODULATE) != 1
-                        || !patterns.insertItem(slot, encoded, false).isEmpty()
-                        || !ItemStack.isSameItemSameTags(patterns.getStackInSlot(slot), encoded)
-                        || !provider.registered().test(details)) {
+            MeOperations.withdraw(grid, storage, actor, blank, 1, blanksBefore, () -> {
+                if (!patterns.insertItem(slot, encoded.copy(), false).isEmpty()
+                        || !ItemStack.matches(patterns.getStackInSlot(slot), encoded)
+                        || !provider.registered(details)) {
                     throw new BridgeError(409, "pattern_install_refused", "AE2 did not register the pattern");
                 }
-            } catch (RuntimeException failure) {
-                try {
-                    if (ItemStack.isSameItemSameTags(patterns.getStackInSlot(slot), encoded)) {
-                        patterns.setItemDirect(slot, ItemStack.EMPTY);
-                    }
-                } finally {
-                    MeOperations.restoreMe(storage, actor, blank, blanksBefore);
+            }, () -> {
+                ItemStack current = patterns.getStackInSlot(slot);
+                if (ItemStack.matches(current, encoded)) {
+                    patterns.extractItem(slot, 1, false);
                 }
-                throw failure;
-            }
+                if (!patterns.getStackInSlot(slot).isEmpty()) {
+                    throw new IllegalStateException("The pattern container did not restore its empty slot");
+                }
+            });
         }
         JsonObject result = stack(details.getPrimaryOutput());
         result.addProperty("slot", slot);
@@ -185,8 +235,8 @@ final class MeCraftingOperations {
         return result;
     }
 
-    static JsonObject craftables(ServerLevel level, BlockPos drive, ResourceLocation item) {
-        IGrid grid = MeOperations.gridAt(level, drive);
+    static JsonObject craftables(MeOperations.Endpoint endpoint, ResourceLocation item) {
+        IGrid grid = endpoint.grid();
         var service = grid.getCraftingService();
         var inventory = grid.getStorageService().getInventory().getAvailableStacks();
         JsonArray variants = new JsonArray();
@@ -201,11 +251,12 @@ final class MeCraftingOperations {
         return result;
     }
 
-    JsonObject order(ServerLevel level, BlockPos drive, UUID id, ResourceLocation item, String variant, int amount) {
+    JsonObject order(MeOperations.Endpoint endpoint, UUID id, ResourceLocation item, String variant, int amount) {
+        ServerLevel level = endpoint.level();
         if (amount < 1) {
             throw new IllegalArgumentException("Specify a positive crafting amount");
         }
-        var request = new OrderRequest(level, drive, item, variant, amount);
+        var request = new OrderRequest(endpoint, item, variant, amount);
         var existing = orders.get(id);
         if (existing != null) {
             if (!existing.request.equals(request)) {
@@ -214,7 +265,7 @@ final class MeCraftingOperations {
             return existing.status();
         }
 
-        IGrid grid = MeOperations.gridAt(level, drive);
+        IGrid grid = endpoint.grid();
         var service = grid.getCraftingService();
         var keys = service.getCraftables(key -> key instanceof AEItemKey && key.getId().equals(item)
                 && (variant == null || variant.equals(variantId(key))));
@@ -297,7 +348,7 @@ final class MeCraftingOperations {
         return Hashing.sha256().hashString(key.toTag().toString(), StandardCharsets.UTF_8).toString();
     }
 
-    private record OrderRequest(ServerLevel level, BlockPos drive, ResourceLocation item, String variant, int amount) {}
+    private record OrderRequest(MeOperations.Endpoint endpoint, ResourceLocation item, String variant, int amount) {}
 
     private static final class Order {
         final UUID id;
@@ -327,11 +378,11 @@ final class MeCraftingOperations {
                 fail("missing_ingredients");
                 return;
             }
-            if (!request.level.hasChunkAt(request.drive) || MeOperations.gridAt(request.level, request.drive) != grid) {
+            if (request.endpoint.grid() != grid) {
                 fail("me_network_changed");
                 return;
             }
-            var actor = MeOperations.playerAction(request.level);
+            var actor = MeOperations.playerAction(request.endpoint.level());
             var service = grid.getCraftingService();
             cpu = service.getCpus().stream().filter(CraftingCPUCluster.class::isInstance)
                     .map(CraftingCPUCluster.class::cast)
@@ -376,9 +427,9 @@ final class MeCraftingOperations {
             if (link != null) {
                 result.addProperty("ae2JobId", link.getCraftingID().toString());
                 result.addProperty("storedBefore", before);
-                if (request.level.hasChunkAt(request.drive)) {
+                if (request.endpoint.level().hasChunkAt(request.endpoint.position())) {
                     try {
-                        if (MeOperations.gridAt(request.level, request.drive) == grid) {
+                        if (request.endpoint.grid() == grid) {
                             result.addProperty("storedNow", MeOperations.count(grid.getStorageService().getInventory(), output));
                         }
                     } catch (BridgeError ignored) {

@@ -4,6 +4,7 @@ import appeng.api.stacks.AEFluidKey;
 import appeng.api.stacks.AEItemKey;
 import com.google.gson.Gson;
 import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParseException;
 import com.mojang.logging.LogUtils;
@@ -19,10 +20,13 @@ import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.level.GameRules;
+import net.minecraft.world.level.biome.Biomes;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.RotatedPillarBlock;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.storage.LevelResource;
 import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.event.TickEvent;
@@ -45,42 +49,36 @@ import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
+import java.util.ArrayList;
 import java.util.HexFormat;
+import java.util.List;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
-import java.util.function.BiFunction;
 import java.util.function.Supplier;
 
 @Mod("minecraft_automation_mcp")
 public final class MinecraftAutomationBridge {
     private static final Logger LOGGER = LogUtils.getLogger();
     private static final Gson GSON = new Gson();
-    private static final int MAX_REQUEST_BYTES = 8192;
+    private static final int MAX_REQUEST_BYTES = 256 * 1024;
+    private static final int BATCH_RECEIPT_LIMIT = 128;
     private static final Path CONFIG_DIRECTORY = FMLPaths.CONFIGDIR.get();
     private static final Path PERMISSIONS_FILE = CONFIG_DIRECTORY.resolve(CheatPermissions.FILE_NAME);
     private static final Path TOKEN_FILE = configFile("bridge.token");
     private static final Path TARGET_FILE = configFile("test-target.json");
     private static final Path CHEST_FIXTURE_FILE = configFile("chest-fixture.json");
-    private static final Path TANK_FIXTURE_FILE = configFile("tank-fixture.json");
-    private static final Path ME_FIXTURE_FILE = configFile("me-fixture.json");
-    private static final Path ME_FLUID_FIXTURE_FILE = configFile("me-fluid-fixture.json");
-    private static final Path GT_FURNACE_FIXTURE_FILE = configFile("gt-furnace-fixture.json");
-    private static final Path GT_MATERIALS_FIXTURE_FILE = configFile("gt-materials-fixture.json");
-    private static final Path GT_COAL_FIXTURE_FILE = configFile("gt-coal-fixture.json");
-    private static final Path GT_CIRCUIT_LOGS_FIXTURE_FILE = configFile("gt-circuit-logs-fixture.json");
-    private static final Path GT_HATCH_CHARGE_FIXTURE_FILE = configFile("gt-hatch-charge-fixture.json");
-    private static final Path GT_DUCT_TAPE_FIXTURE_FILE = configFile("gt-duct-tape-fixture.json");
-    private static final Path GT_RECIPE_INPUTS_FIXTURE_FILE = configFile("gt-recipe-inputs-fixture.json");
-    private static final Path GT_RECIPE_POWER_FIXTURE_FILE = configFile("gt-recipe-power-fixture.json");
     private static final Path ME_WORKBENCH_FIXTURE_FILE = configFile("me-workbench-fixture.json");
 
-    private final GtProductionTestFixtures gtProductionFixtures = new GtProductionTestFixtures();
     private final MeCraftingOperations meCrafting = new MeCraftingOperations();
     private final TreeFarmOperations treeFarm = new TreeFarmOperations();
+    private final MeSpruceFarmOperations meSpruceFarm = new MeSpruceFarmOperations();
+    private final Map<UUID, BatchReceipt> batchReceipts = new LinkedHashMap<>();
     private final String instanceId = UUID.randomUUID().toString();
     private volatile MinecraftServer activeWorld;
 
@@ -100,19 +98,19 @@ public final class MinecraftAutomationBridge {
 
     private void onServerTick(TickEvent.ServerTickEvent event) {
         if (event.phase == TickEvent.Phase.END && event.getServer() == activeWorld) {
-            gtProductionFixtures.tick(event.getServer(),
-                    () -> CheatPermissions.read(PERMISSIONS_FILE).allowTestFixtures());
             meCrafting.tick();
             treeFarm.tick(event.getServer());
+            meSpruceFarm.tick(event.getServer());
         }
     }
 
     private void onWorldStopping(ServerStoppingEvent event) {
-        gtProductionFixtures.clear(event.getServer());
         if (activeWorld == event.getServer()) {
             activeWorld = null;
             meCrafting.clear();
+            batchReceipts.clear();
             treeFarm.stop();
+            meSpruceFarm.stop();
         }
     }
 
@@ -258,6 +256,19 @@ public final class MinecraftAutomationBridge {
 
         return switch (operation) {
             case "get_game_status" -> onServerThread(server, () -> gameStatus(server));
+            case "set_wandering_trader_spawning" -> {
+                String expectedWorld = stringField(request, "expectedWorldFolder");
+                boolean enabled = booleanField(request, "enabled");
+                yield onServerThread(server, () -> setWanderingTraderSpawning(server, expectedWorld, enabled));
+            }
+            case "set_overworld_chunks_to_plains" -> {
+                String expectedWorld = stringField(request, "expectedWorldFolder");
+                int minX = coordinate(request, "minChunkX");
+                int maxX = coordinate(request, "maxChunkX");
+                int minZ = coordinate(request, "minChunkZ");
+                int maxZ = coordinate(request, "maxChunkZ");
+                yield onServerThread(server, () -> setOverworldChunksToPlains(server, expectedWorld, minX, maxX, minZ, maxZ));
+            }
             case "find_spruce_and_me" -> {
                 BlockLocation site = location(request);
                 int radius = request.has("radius") ? coordinate(request, "radius") : 24;
@@ -269,24 +280,70 @@ public final class MinecraftAutomationBridge {
                 BlockLocation drive = location(objectField(request, "drive"));
                 String expected = operation.equals("inspect_giant_spruce") ? null : stringField(request, "expectedPlan");
                 yield onServerThread(server, () -> GiantSpruceOperations.run(site.level(server), site.position,
-                        drive.level(server), drive.position, expected));
+                        drive.me(server), expected));
+            }
+            case "harvest_rubber_trunk_to_me" -> {
+                requireAe2();
+                BlockLocation site = location(request);
+                BlockLocation drive = location(objectField(request, "drive"));
+                String expectedWorld = stringField(request, "expectedWorldFolder");
+                yield onServerThread(server, () -> {
+                    requireExpectedWorld(server, expectedWorld);
+                    return RubberTreeOperations.harvest(site.level(server), site.position, drive.me(server));
+                });
             }
             case "list_ftb_quest_chapters", "list_ftb_quests", "get_ftb_quest" -> {
                 if (!ModList.get().isLoaded("ftbquests")) {
                     throw new BridgeError(409, "ftb_quests_unavailable", "FTB Quests is not loaded");
                 }
-                yield onServerThread(server, () -> FtbQuestOperations.read(server, operation, request));
+                yield onServerThread(server, () -> FtbQuestOperations.run(server, operation, request));
+            }
+            case "submit_ftb_item_from_me" -> {
+                requireAe2();
+                if (!ModList.get().isLoaded("ftbquests")) {
+                    throw new BridgeError(409, "ftb_quests_unavailable", "FTB Quests is not loaded");
+                }
+                BlockLocation drive = location(objectField(request, "drive"));
+                String expectedWorld = stringField(request, "expectedWorldFolder");
+                yield onServerThread(server, () -> {
+                    requireExpectedWorld(server, expectedWorld);
+                    return FtbQuestOperations.run(server, operation, request, drive.me(server));
+                });
+            }
+            case "check_ftb_task", "claim_ftb_reward" -> {
+                if (!ModList.get().isLoaded("ftbquests")) {
+                    throw new BridgeError(409, "ftb_quests_unavailable", "FTB Quests is not loaded");
+                }
+                String expectedWorld = stringField(request, "expectedWorldFolder");
+                yield onServerThread(server, () -> {
+                    requireExpectedWorld(server, expectedWorld);
+                    return FtbQuestOperations.run(server, operation, request);
+                });
             }
             case "start_tree_farm" -> {
                 BlockLocation site = location(request);
                 BlockPos supply = coordinates(objectField(request, "supply"));
                 BlockPos output = coordinates(objectField(request, "output"));
+                Direction supplySide = optionalSide(request, "supplySide");
+                Direction outputSide = optionalSide(request, "outputSide");
                 String tree = stringField(request, "tree");
                 yield onServerThread(server, () -> treeFarm.start(site.level(server),
-                        site.position, supply, output, tree));
+                        site.position, supply, supplySide, output, outputSide, tree));
             }
             case "get_tree_farm_status" -> onServerThread(server, treeFarm::status);
             case "stop_tree_farm" -> onServerThread(server, treeFarm::stop);
+            case "start_me_spruce_farm" -> {
+                requireAe2();
+                BlockLocation site = location(request);
+                BlockLocation drive = location(objectField(request, "drive"));
+                String expectedWorld = stringField(request, "expectedWorldFolder");
+                yield onServerThread(server, () -> {
+                    requireExpectedWorld(server, expectedWorld);
+                    return meSpruceFarm.start(site.level(server), site.position, drive.me(server));
+                });
+            }
+            case "get_me_spruce_farm_status" -> onServerThread(server, meSpruceFarm::status);
+            case "stop_me_spruce_farm" -> onServerThread(server, meSpruceFarm::stop);
             case "verify_tree_farm" -> {
                 TestTarget target = readTestTarget(TARGET_FILE);
                 yield onCheatServerThread(server, permission, () -> {
@@ -300,21 +357,23 @@ public final class MinecraftAutomationBridge {
                 BlockLocation site = location(request);
                 yield onServerThread(server, () -> blockInfo(site.level(server), site.position));
             }
+            case "check_multiblock_blocks" -> onServerThread(server, () -> checkMultiblockBlocks(server, request));
             case "get_container" -> {
                 BlockLocation site = location(request);
                 yield onServerThread(server, () ->
-                        ChestOperations.contents(site.level(server), site.position));
+                        ItemHandlerOperations.contents(site.level(server), site.position, site.side));
             }
             case "transfer_item" -> {
                 BlockLocation source = location(objectField(request, "source"));
                 BlockLocation target = location(objectField(request, "target"));
                 int sourceSlot = coordinate(request, "sourceSlot");
+                Integer targetSlot = request.has("targetSlot") ? coordinate(request, "targetSlot") : null;
                 int amount = coordinate(request, "amount");
                 String expectedStackToken = stringField(request, "expectedStackToken");
                 yield onServerThread(server, () -> {
-                    JsonObject result = ChestOperations.transfer(
-                            source.level(server), source.position, sourceSlot,
-                            target.level(server), target.position, amount, expectedStackToken);
+                    JsonObject result = ItemHandlerOperations.transfer(
+                            source.level(server), source.position, source.side, sourceSlot,
+                            target.level(server), target.position, target.side, targetSlot, amount, expectedStackToken);
                     LOGGER.info("Minecraft Automation MCP transferred {} {} from {} {} slot {} to {} {}", amount,
                             result.get("item").getAsString(), source.dimension, source.position,
                             sourceSlot, target.dimension, target.position);
@@ -324,7 +383,7 @@ public final class MinecraftAutomationBridge {
             case "get_tank" -> {
                 BlockLocation site = location(request);
                 yield onServerThread(server, () ->
-                        TankOperations.contents(site.level(server), site.position));
+                        TankOperations.contents(site.level(server), site.position, site.side));
             }
             case "transfer_fluid" -> {
                 BlockLocation source = location(objectField(request, "source"));
@@ -333,8 +392,8 @@ public final class MinecraftAutomationBridge {
                 String expectedFluidToken = stringField(request, "expectedFluidToken");
                 yield onServerThread(server, () -> {
                     JsonObject result = TankOperations.transfer(
-                            source.level(server), source.position,
-                            target.level(server), target.position, amount, expectedFluidToken);
+                            source.level(server), source.position, source.side,
+                            target.level(server), target.position, target.side, amount, expectedFluidToken);
                     LOGGER.info("Minecraft Automation MCP transferred {} mB of {} from {} {} to {} {}", amount,
                             result.get("fluid").getAsString(), source.dimension, source.position,
                             target.dimension, target.position);
@@ -351,18 +410,19 @@ public final class MinecraftAutomationBridge {
             case "encode_me_crafting_pattern", "encode_me_processing_pattern" -> {
                 requireAe2();
                 BlockLocation site = location(request);
-                BlockPos provider = position(objectField(request, "provider"));
+                JsonObject providerLocation = objectField(request, "provider");
+                BlockPos provider = position(providerLocation);
+                Direction providerSide = optionalSide(providerLocation);
                 int slot = coordinate(request, "slot");
                 boolean processing = "encode_me_processing_pattern".equals(operation);
                 ResourceLocation recipe = processing ? null : resourceId(request, "recipe");
                 JsonArray ingredients = processing ? processingArray(request, "inputs") : craftingGrid(request);
                 JsonArray outputs = processing ? processingArray(request, "outputs") : null;
                 yield onServerThread(server, () -> {
-                    ServerLevel level = site.level(server);
                     loadedLevel(server, site.dimension, provider);
                     return processing
-                            ? MeCraftingOperations.installProcessingPattern(level, site.position, provider, slot, ingredients, outputs)
-                            : MeCraftingOperations.installPattern(level, site.position, provider, slot, recipe, ingredients);
+                            ? MeCraftingOperations.installProcessingPattern(site.me(server), provider, providerSide, slot, ingredients, outputs)
+                            : MeCraftingOperations.installPattern(site.me(server), provider, providerSide, slot, recipe, ingredients);
                 });
             }
             case "get_me_craftable", "order_me_craft" -> {
@@ -371,13 +431,13 @@ public final class MinecraftAutomationBridge {
                 ResourceLocation item = resourceId(request, "item");
                 if ("get_me_craftable".equals(operation)) {
                     yield onServerThread(server, () ->
-                            MeCraftingOperations.craftables(site.level(server), site.position, item));
+                            MeCraftingOperations.craftables(site.me(server), item));
                 }
                 UUID id = UUID.fromString(stringField(request, "orderId"));
                 String variant = request.has("variant") ? stringField(request, "variant") : null;
                 int amount = coordinate(request, "amount");
                 yield onServerThread(server, () ->
-                        meCrafting.order(site.level(server), site.position, id, item, variant, amount));
+                        meCrafting.order(site.me(server), id, item, variant, amount));
             }
             case "get_me_craft_order", "cancel_me_craft_order" -> {
                 requireAe2();
@@ -391,10 +451,22 @@ public final class MinecraftAutomationBridge {
                 JsonArray grid = craftingGrid(request);
                 yield onServerThread(server, () -> {
                     JsonObject result = MeWorkbenchOperations.craft(
-                            site.level(server), site.position, recipe, grid);
+                            site.me(server), recipe, grid);
                     LOGGER.info("Minecraft Automation MCP ran workbench recipe {} at ME {} {}: {}", recipe, site.dimension, site.position, result);
                     return result;
                 });
+            }
+            case "craft_batch_from_me" -> {
+                requireAe2();
+                BlockLocation site = location(request);
+                ResourceLocation recipe = resourceId(request, "recipe");
+                JsonArray grid = craftingGrid(request);
+                int repetitions = coordinate(request, "repetitions");
+                if (repetitions < 1 || repetitions > 64) {
+                    throw new IllegalArgumentException("Choose between 1 and 64 crafts");
+                }
+                yield onServerThread(server, () -> runBatchWrite(server, request,
+                        () -> MeWorkbenchOperations.craftBatch(site.me(server), recipe, grid, repetitions)));
             }
             case "prepare_me_workbench_test" -> {
                 requireAe2();
@@ -415,26 +487,79 @@ public final class MinecraftAutomationBridge {
                 BlockLocation site = location(request);
                 String field = item ? "item" : "fluid";
                 ResourceLocation id = resourceId(request, field);
-                yield onServerThread(server, () -> MeOperations.contents(site.level(server),
-                        site.position, id, item ? AEItemKey.class : AEFluidKey.class, field));
+                yield onServerThread(server, () -> MeOperations.contents(
+                        site.me(server), id, item ? AEItemKey.class : AEFluidKey.class, field));
+            }
+            case "get_me_machine_snapshot" -> onServerThread(server, () -> meMachineSnapshot(server, request));
+            case "transfer_me_machine_batch" -> {
+                requireAe2();
+                yield onServerThread(server, () -> runBatchWrite(server, request,
+                        () -> transferMachineBatch(server, request)));
+            }
+            case "get_host_inventory" -> onServerThread(server, () -> HostInventoryOperations.contents(server));
+            case "transfer_host_me_item" -> {
+                requireAe2();
+                BlockLocation drive = location(objectField(request, "drive"));
+                ResourceLocation item = resourceId(request, "item");
+                boolean toMe = transferDirection(stringField(request, "direction"), "me", "Invalid ME transfer direction");
+                int slot = coordinate(request, "slot");
+                int amount = coordinate(request, "amount");
+                String token = stringField(request, "expectedSourceToken");
+                String expectedWorld = stringField(request, "expectedWorldFolder");
+                yield onServerThread(server, () -> {
+                    requireExpectedWorld(server, expectedWorld);
+                    return HostInventoryOperations.transfer(server, drive.me(server), slot, item, amount, token, toMe);
+                });
+            }
+            case "place_block_from_me" -> {
+                requireAe2();
+                requireGt();
+                BlockLocation site = location(request);
+                BlockLocation drive = location(objectField(request, "drive"));
+                ResourceLocation item = resourceId(request, "item");
+                String token = stringField(request, "expectedSourceToken");
+                String expectedWorld = stringField(request, "expectedWorldFolder");
+                yield onServerThread(server, () -> {
+                    requireExpectedWorld(server, expectedWorld);
+                    return MeBlockPlacementOperations.place(site.level(server), site.position, drive.me(server), item, token);
+                });
+            }
+            case "install_gt_cover_from_me" -> {
+                requireAe2();
+                requireGt();
+                ResourceLocation item = resourceId(request, "item");
+                Direction side = side(request);
+                BlockLocation site = location(request);
+                BlockLocation drive = location(objectField(request, "drive"));
+                String token = stringField(request, "expectedSourceToken");
+                String expectedWorld = stringField(request, "expectedWorldFolder");
+                yield onServerThread(server, () -> {
+                    requireExpectedWorld(server, expectedWorld);
+                    return MeGtCoverOperations.install(site.level(server), site.position, side,
+                            drive.me(server), item, token);
+                });
             }
             case "transfer_me_item" -> {
                 requireAe2();
-                BlockLocation chest = location(objectField(request, "chest"));
+                if (request.has("container") == request.has("chest")) {
+                    throw new IllegalArgumentException("Supply one container location");
+                }
+                BlockLocation container = location(objectField(request, request.has("container") ? "container" : "chest"));
                 BlockLocation drive = location(objectField(request, "drive"));
                 ResourceLocation item = resourceId(request, "item");
                 String direction = stringField(request, "direction");
                 boolean toMe = transferDirection(direction, "me", "Invalid ME transfer direction");
-                int sourceSlot = toMe ? coordinate(request, "sourceSlot") : -1;
+                Integer slot = toMe ? coordinate(request, "sourceSlot")
+                        : request.has("targetSlot") ? coordinate(request, "targetSlot") : null;
                 int amount = coordinate(request, "amount");
                 String token = stringField(request, "expectedSourceToken");
                 yield onServerThread(server, () -> {
                     JsonObject result = MeOperations.transfer(
-                            chest.level(server), chest.position,
-                            drive.level(server), drive.position,
-                            toMe, item, amount, sourceSlot, token);
-                    LOGGER.info("Minecraft Automation MCP moved {} {} {} between chest {} {} and ME drive {} {}", amount, item,
-                            direction, chest.dimension, chest.position, drive.dimension, drive.position);
+                            toMe ? ItemHandlerOperations.at(container.level(server), container.position, container.side)
+                                    : ItemHandlerOperations.insertionTarget(container.level(server), container.position, container.side),
+                            drive.me(server), toMe, item, amount, slot, token);
+                    LOGGER.info("Minecraft Automation MCP moved {} {} {} between container {} {} and ME node {} {}", amount, item,
+                            direction, container.dimension, container.position, drive.dimension, drive.position);
                     return result;
                 });
             }
@@ -449,18 +574,32 @@ public final class MinecraftAutomationBridge {
                 String token = stringField(request, "expectedSourceToken");
                 yield onServerThread(server, () -> {
                     JsonObject result = MeFluidOperations.transfer(
-                            tank.level(server), tank.position,
-                            drive.level(server), drive.position,
+                            tank.level(server), tank.position, tank.side,
+                            drive.me(server),
                             toMe, fluid, amount, token);
                     LOGGER.info("Minecraft Automation MCP moved {} mB of {} {} between tank {} {} and ME drive {} {}", amount, fluid,
                             direction, tank.dimension, tank.position, drive.dimension, drive.position);
                     return result;
                 });
             }
-            case "get_gt_machine" -> {
+            case "fill_me_fluid_bucket" -> {
+                requireAe2();
+                BlockLocation drive = location(objectField(request, "drive"));
+                ResourceLocation fluid = resourceId(request, "fluid");
+                String fluidToken = stringField(request, "expectedFluidToken");
+                String bucketToken = stringField(request, "expectedBucketToken");
+                String expectedWorld = stringField(request, "expectedWorldFolder");
+                yield onServerThread(server, () -> {
+                    requireExpectedWorld(server, expectedWorld);
+                    return MeFluidOperations.fillBucket(drive.me(server), fluid, fluidToken, bucketToken);
+                });
+            }
+            case "find_gt_recipes" -> {
                 requireGt();
-                BlockLocation site = location(request);
-                yield onServerThread(server, () -> GtMachineOperations.inspect(site.level(server), site.position));
+                boolean fluid = request.has("fluid");
+                ResourceLocation expected = resourceId(request, fluid ? "fluid" : "item");
+                ResourceLocation type = request.has("recipeType") ? resourceId(request, "recipeType") : null;
+                yield onServerThread(server, () -> GtRecipeOperations.find(server, expected, fluid, type));
             }
             case "configure_gt_machine" -> {
                 requireGt();
@@ -470,106 +609,38 @@ public final class MinecraftAutomationBridge {
                 yield onServerThread(server, () -> GtMachineOperations.configure(
                         site.level(server), site.position, working, circuit));
             }
-            case "transfer_gt_me_item" -> {
+            case "get_gt_multiblock_layout" -> {
                 requireGt();
-                requireAe2();
-                BlockLocation machine = location(objectField(request, "machine"));
-                BlockLocation drive = location(objectField(request, "drive"));
-                ResourceLocation item = resourceId(request, "item");
-                String direction = stringField(request, "direction");
-                boolean toMachine = transferDirection(direction, "machine", "Invalid GT and ME transfer direction");
-                int slot = coordinate(request, "machineSlot");
-                int amount = coordinate(request, "amount");
-                String token = stringField(request, "expectedSourceToken");
-                yield onServerThread(server, () -> {
-                    JsonObject result = GtMachineOperations.transferMe(
-                            machine.level(server), machine.position,
-                            drive.level(server), drive.position, toMachine, slot, item, amount, token);
-                    LOGGER.info("Minecraft Automation MCP moved {} {} {} between GT {} and ME {}", amount, item,
-                            direction, machine.position, drive.position);
-                    return result;
-                });
+                boolean byId = request.has("structure");
+                if (byId == request.has("controller")) {
+                    throw new BridgeError(400, "multiblock_target_required", "Supply either a structure ID or a controller location");
+                }
+                int previewIndex = request.has("previewIndex") ? coordinate(request, "previewIndex") : 0;
+                var parts = multiblockParts(request);
+                if (byId) {
+                    ResourceLocation id = resourceId(request, "structure");
+                    yield onServerThread(server, () -> GtMultiblockOperations.layout(id, previewIndex, parts));
+                }
+                BlockLocation controller = location(objectField(request, "controller"));
+                yield onServerThread(server, () -> GtMultiblockOperations.layout(
+                        controller.level(server), controller.position, previewIndex, parts));
             }
-            case "transfer_gt_me_fluid" -> {
-                requireGt();
-                requireAe2();
-                BlockLocation machine = location(objectField(request, "machine"));
-                BlockLocation drive = location(objectField(request, "drive"));
-                ResourceLocation fluid = resourceId(request, "fluid");
-                String direction = stringField(request, "direction");
-                boolean toMachine = transferDirection(direction, "machine", "Invalid GT and ME transfer direction");
-                int tank = coordinate(request, "machineTank");
-                int amount = coordinate(request, "amount");
-                String token = stringField(request, "expectedSourceToken");
-                yield onServerThread(server, () -> {
-                    JsonObject result = GtMachineFluidOperations.transferMe(
-                            machine.level(server), machine.position,
-                            drive.level(server), drive.position, toMachine,
-                            tank, fluid, amount, token);
-                    LOGGER.info("Minecraft Automation MCP moved {} mB of {} {} between GT {} and ME {}", amount, fluid,
-                            direction, machine.position, drive.position);
-                    return result;
-                });
-            }
-            case "prepare_gt_coal_test", "prepare_gt_duct_tape_test" -> {
-                boolean tape = "prepare_gt_duct_tape_test".equals(operation);
-                requireGt();
-                requireAe2();
-                yield onTestTarget(server, permission, tape ? GT_DUCT_TAPE_FIXTURE_FILE : GT_COAL_FIXTURE_FILE,
-                        "this GT fixture", tape ? GtMachineFluidOperations::prepareTestDuctTape
-                                : GtMachineFluidOperations::prepareTestCoal);
-            }
-            case "transfer_gt_machine_item" -> {
-                requireGt();
-                BlockLocation source = location(objectField(request, "source"));
-                BlockLocation target = location(objectField(request, "target"));
-                int sourceSlot = coordinate(request, "sourceSlot");
-                int targetSlot = coordinate(request, "targetSlot");
-                int amount = coordinate(request, "amount");
-                ResourceLocation item = resourceId(request, "item");
-                String token = stringField(request, "expectedSourceToken");
-                yield onServerThread(server, () -> {
-                    JsonObject result = GtMachineOperations.transferMachines(
-                            source.level(server), source.position, sourceSlot,
-                            target.level(server), target.position, targetSlot, item, amount, token);
-                    LOGGER.info("Minecraft Automation MCP moved {} {} from GT {} to GT {}", amount, item, source.position, target.position);
-                    return result;
-                });
-            }
-            case "get_gt_coke_oven_layout", "get_gt_multiblock_layout" -> {
-                String kind = "get_gt_coke_oven_layout".equals(operation)
-                        ? "gtceu:coke_oven" : stringField(request, "structure");
-                requireGt();
-                yield onServerThread(server, () -> GtMultiblockOperations.layout(kind));
-            }
-            case "build_gt_coke_oven_from_me", "build_gt_multiblock_from_me" -> {
-                String kind = "build_gt_coke_oven_from_me".equals(operation)
-                        ? "gtceu:coke_oven" : stringField(request, "structure");
+            case "build_gt_multiblock_from_me" -> {
+                ResourceLocation kind = resourceId(request, "structure");
+                int previewIndex = request.has("previewIndex") ? coordinate(request, "previewIndex") : 0;
                 requireGt();
                 requireAe2();
                 BlockLocation controller = location(objectField(request, "controller"));
                 BlockLocation drive = location(objectField(request, "drive"));
-                yield onServerThread(server, () -> {
+                var parts = multiblockParts(request);
+                yield onServerThread(server, 25, () -> {
                     JsonObject result = GtMultiblockOperations.build(
                             controller.level(server), controller.position,
-                            drive.level(server), drive.position, kind);
+                            drive.me(server), kind, previewIndex, parts);
                     LOGGER.info("Minecraft Automation MCP built {} at {} {} from ME {} {}", kind, controller.dimension,
                             controller.position, drive.dimension, drive.position);
                     return result;
                 });
-            }
-            case "prepare_gt_recipe_inputs_test", "start_gt_recipe_power_test", "stop_gt_recipe_power_test" -> {
-                requireGt();
-                boolean inputs = "prepare_gt_recipe_inputs_test".equals(operation);
-                if (inputs) {
-                    requireAe2();
-                }
-                yield onTestTarget(server, permission, inputs ? GT_RECIPE_INPUTS_FIXTURE_FILE : GT_RECIPE_POWER_FIXTURE_FILE,
-                        "the GT recipe test", switch (operation) {
-                            case "prepare_gt_recipe_inputs_test" -> GtProductionTestFixtures::prepareInputs;
-                            case "start_gt_recipe_power_test" -> gtProductionFixtures::start;
-                            default -> gtProductionFixtures::stop;
-                        });
             }
             case "service_gt_maintenance" -> {
                 requireGt();
@@ -580,53 +651,16 @@ public final class MinecraftAutomationBridge {
                 yield onServerThread(server, () -> {
                     JsonObject result = GtMachineOperations.serviceMaintenance(
                             hatch.level(server), hatch.position,
-                            drive.level(server), drive.position, token);
+                            drive.me(server), token);
                     LOGGER.info("Minecraft Automation MCP serviced GT maintenance hatch {} using {} duct tape from ME {}",
                             hatch.position, result.get("tapeUsed").getAsInt(), drive.position);
                     return result;
                 });
             }
-            case "prepare_gt_circuit_logs_test", "prepare_gt_hatch_charge_test" -> {
-                requireGt();
-                boolean logs = "prepare_gt_circuit_logs_test".equals(operation);
-                if (logs) {
-                    requireAe2();
-                }
-                yield onTestTarget(server, permission, logs ? GT_CIRCUIT_LOGS_FIXTURE_FILE : GT_HATCH_CHARGE_FIXTURE_FILE,
-                        "the GT circuit test", logs ? GtMachineFluidOperations::prepareTestLogs
-                                : GtMachineOperations::prepareTestHatchCharge);
-            }
-            case "prepare_gt_furnace_test", "prepare_gt_materials_test" -> {
-                requireGt();
-                boolean furnace = "prepare_gt_furnace_test".equals(operation);
-                String kind = request.has("structure") ? stringField(request, "structure") : "gtceu:coke_oven";
-                if (!furnace) {
-                    requireAe2();
-                }
-                yield onTestTarget(server, permission, furnace ? GT_FURNACE_FIXTURE_FILE : GT_MATERIALS_FIXTURE_FILE,
-                        "the GT fixture", furnace ? GtMachineOperations::prepareTestFurnace
-                                : (level, at) -> GtMultiblockOperations.prepareTestMaterials(level, at, kind));
-            }
-            case "prepare_me_fluid_cell" -> {
-                requireAe2();
-                yield onTestTarget(server, permission, ME_FLUID_FIXTURE_FILE, "the ME fluid cell",
-                        MeFluidOperations::prepareTestFluidCell);
-            }
-            case "prepare_me_test" -> {
-                requireAe2();
-                StorageFixture fixture = readStorageFixture(ME_FIXTURE_FILE);
-                yield onCheatServerThread(server, permission, () -> MeOperations.prepareTestNetwork(
-                        storageFixtureLevel(server, fixture, "the ME fixture"), fixture.source, fixture.target));
-            }
-            case "prepare_chest_test", "prepare_tank_test" -> {
-                boolean tankTest = "prepare_tank_test".equals(operation);
-                StorageFixture fixture = readStorageFixture(tankTest ? TANK_FIXTURE_FILE : CHEST_FIXTURE_FILE);
-                yield onCheatServerThread(server, permission, () -> {
-                    ServerLevel level = storageFixtureLevel(server, fixture, "the storage fixture");
-                    return tankTest
-                            ? TankOperations.prepareTestTanks(level, fixture.source, fixture.target)
-                            : ChestOperations.prepareTestChests(level, fixture.source, fixture.target);
-                });
+            case "prepare_chest_test" -> {
+                StorageFixture fixture = readStorageFixture(CHEST_FIXTURE_FILE);
+                yield onCheatServerThread(server, permission, () -> ChestOperations.prepareTestChests(
+                        storageFixtureLevel(server, fixture, "the chest fixture"), fixture.source, fixture.target));
             }
             case "set_test_block" -> {
                 BlockLocation site = location(request);
@@ -639,13 +673,6 @@ public final class MinecraftAutomationBridge {
         };
     }
 
-    private JsonObject onTestTarget(MinecraftServer server, Permission permission, Path file, String description,
-                                    BiFunction<ServerLevel, BlockPos, JsonObject> action) {
-        TestTarget fixture = readTestTarget(file);
-        return onCheatServerThread(server, permission,
-                () -> action.apply(fixtureLevel(server, fixture, description), fixture.position));
-    }
-
     private JsonObject onCheatServerThread(MinecraftServer server, Permission permission, Supplier<JsonObject> action) {
         return onServerThread(server, () -> {
             requireCheatPermission(permission);
@@ -653,7 +680,238 @@ public final class MinecraftAutomationBridge {
         });
     }
 
+    private static JsonObject meMachineSnapshot(MinecraftServer server, JsonObject request) {
+        JsonObject result = new JsonObject();
+        if (request.has("items")) {
+            requireAe2();
+            BlockLocation drive = location(objectField(request, "drive"));
+            List<ResourceLocation> ids = new ArrayList<>();
+            for (JsonElement entry : batchArray(request, "items", 128)) {
+                JsonObject item = new JsonObject();
+                item.add("id", entry);
+                ids.add(resourceId(item, "id"));
+            }
+            try {
+                result.add("items", MeOperations.contents(drive.me(server), ids, AEItemKey.class, "item"));
+            } catch (BridgeError exception) {
+                result.add("itemsError", error(exception.code(), exception.getMessage()));
+            }
+        }
+        if (request.has("machines")) {
+            JsonArray machines = new JsonArray();
+            for (JsonElement entry : batchArray(request, "machines", 32)) {
+                JsonObject machine = batchObject(entry);
+                BlockLocation site = location(machine);
+                JsonObject row = itemLocation(site, legacyMachineLabel(machine));
+                try {
+                    row.add("state", ItemHandlerOperations.contents(site.level(server), site.position, site.side));
+                } catch (BridgeError exception) {
+                    row.add("error", error(exception.code(), exception.getMessage()));
+                }
+                machines.add(row);
+            }
+            result.add("machines", machines);
+        }
+        if (result.size() == 0) {
+            throw new IllegalArgumentException("Supply items, machines, or both");
+        }
+        return result;
+    }
+
+    private static JsonArray batchArray(JsonObject request, String field, int limit) {
+        JsonElement value = request.get(field);
+        if (value == null || !value.isJsonArray()) {
+            throw new IllegalArgumentException("Missing array: " + field);
+        }
+        JsonArray array = value.getAsJsonArray();
+        if (array.isEmpty() || array.size() > limit) {
+            throw new IllegalArgumentException("Invalid batch size: " + field);
+        }
+        return array;
+    }
+
+    private static JsonObject batchObject(JsonElement element) {
+        if (!element.isJsonObject()) {
+            throw new IllegalArgumentException("Batch entries must be objects");
+        }
+        return element.getAsJsonObject();
+    }
+
+    private static String legacyMachineLabel(JsonObject machine) {
+        return machine.has("kind") ? stringField(machine, "kind") : null;
+    }
+
+    private static JsonObject itemLocation(BlockLocation site, String label) {
+        JsonObject result = new JsonObject();
+        if (label != null) {
+            result.addProperty("kind", label);
+        }
+        result.addProperty("dimension", site.dimension.toString());
+        result.add("position", positionJson(site.position));
+        if (site.side != null) {
+            result.addProperty("side", site.side.getName());
+        }
+        return result;
+    }
+
+    private JsonObject runBatchWrite(MinecraftServer server, JsonObject request, Supplier<JsonObject> write) {
+        requireExpectedWorld(server, stringField(request, "expectedWorldFolder"));
+        UUID id = UUID.fromString(stringField(request, "requestId"));
+        BatchReceipt receipt = batchReceipts.get(id);
+        if (receipt != null) {
+            if (!receipt.request.equals(request)) {
+                throw new BridgeError(409, "batch_request_conflict", "The request ID already identifies another batch");
+            }
+            return receipt.result;
+        }
+        JsonObject result;
+        try {
+            result = write.get();
+        } catch (BridgeError | IllegalArgumentException exception) {
+            throw exception;
+        } catch (RuntimeException exception) {
+            LOGGER.error("Minecraft Automation MCP batch {} failed with an unknown outcome", id, exception);
+            result = error("batch_outcome_unknown", "A step failed unexpectedly. Verify inventory and slots before submitting more writes.");
+        }
+        result.addProperty("requestId", id.toString());
+        if (batchReceipts.size() == BATCH_RECEIPT_LIMIT) {
+            batchReceipts.remove(batchReceipts.keySet().iterator().next());
+        }
+        batchReceipts.put(id, new BatchReceipt(request, result));
+        return result;
+    }
+
+    private static JsonObject transferMachineBatch(MinecraftServer server, JsonObject request) {
+        BlockLocation drive = location(objectField(request, "drive"));
+        List<MachineTransfer> transfers = new ArrayList<>();
+        for (JsonElement entry : batchArray(request, "transfers", 32)) {
+            transfers.add(MachineTransfer.parse(batchObject(entry)));
+        }
+        ServerLevel driveLevel = drive.level(server);
+        var grid = drive.me(server).grid();
+        var actor = MeOperations.playerAction(driveLevel);
+        var storage = grid.getStorageService().getInventory();
+        var initial = storage.getAvailableStacks();
+        AEItemKey[] sources = new AEItemKey[transfers.size()];
+        JsonObject[] sourceErrors = new JsonObject[transfers.size()];
+        for (int index = 0; index < transfers.size(); index++) {
+            MachineTransfer transfer = transfers.get(index);
+            if (transfer.toMachine) {
+                try {
+                    sources[index] = MeOperations.resolveMeStack(initial, AEItemKey.class, transfer.item, transfer.token);
+                } catch (BridgeError exception) {
+                    sourceErrors[index] = error(exception.code(), exception.getMessage());
+                }
+            }
+        }
+
+        JsonArray results = new JsonArray();
+        for (int index = 0; index < transfers.size(); index++) {
+            MachineTransfer transfer = transfers.get(index);
+            JsonObject row = itemLocation(transfer.site, transfer.label);
+            row.addProperty("index", index);
+            row.addProperty("direction", transfer.toMachine ? "to_machine" : "from_machine");
+            row.addProperty("item", transfer.item.toString());
+            row.addProperty("slot", transfer.slot);
+            row.addProperty("requested", transfer.amount);
+            if (sourceErrors[index] != null) {
+                row.add("error", sourceErrors[index]);
+            } else {
+                try {
+                    AEItemKey source = sources[index];
+                    // A prior transfer in this batch can change the count of the same exact variant.
+                    String token = source == null ? transfer.token
+                            : MeOperations.meToken(source, MeOperations.count(storage, source));
+                    var site = transfer.site;
+                    var handler = transfer.toMachine
+                            ? ItemHandlerOperations.insertionTarget(site.level(server), site.position, site.side)
+                            : ItemHandlerOperations.at(site.level(server), site.position, site.side);
+                    row.add("transfer", MeOperations.transfer(handler, grid, actor, !transfer.toMachine,
+                            transfer.item, transfer.amount, transfer.slot, token));
+                } catch (BridgeError exception) {
+                    row.add("error", error(exception.code(), exception.getMessage()));
+                }
+            }
+            results.add(row);
+        }
+        JsonObject result = new JsonObject();
+        result.add("transfers", results);
+        return result;
+    }
+
+    private record MachineTransfer(BlockLocation site, String label, boolean toMachine, int slot,
+                                   ResourceLocation item, int amount, String token) {
+        static MachineTransfer parse(JsonObject entry) {
+            JsonObject machine = objectField(entry, "machine");
+            int slot = coordinate(entry, "slot");
+            int amount = coordinate(entry, "amount");
+            if (slot < 0 || amount < 1) {
+                throw new IllegalArgumentException("Choose a nonnegative slot and positive transfer amount");
+            }
+            return new MachineTransfer(location(machine), legacyMachineLabel(machine),
+                    transferDirection(stringField(entry, "direction"), "machine", "Invalid batch transfer direction"),
+                    slot, resourceId(entry, "item"), amount, stringField(entry, "expectedSourceToken"));
+        }
+
+    }
+
+    private record BatchReceipt(JsonObject request, JsonObject result) {}
+
+    private static JsonObject checkMultiblockBlocks(MinecraftServer server, JsonObject request) {
+        ResourceLocation dimension = dimension(request);
+        ServerLevel level = server.getLevel(ResourceKey.create(Registries.DIMENSION, dimension));
+        if (level == null) {
+            throw new BridgeError(404, "unknown_dimension", "Dimension is unavailable: " + dimension);
+        }
+        Map<BlockPos, Block> expected = new LinkedHashMap<>();
+        for (JsonElement entry : batchArray(request, "blocks", 1024)) {
+            JsonObject row = batchObject(entry);
+            BlockPos position = position(row);
+            ResourceLocation id = resourceId(row, "block");
+            if (!ForgeRegistries.BLOCKS.containsKey(id)) {
+                throw new BridgeError(400, "unknown_block", "Expected block ID is not registered: " + id);
+            }
+            if (expected.putIfAbsent(position, ForgeRegistries.BLOCKS.getValue(id)) != null) {
+                throw new BridgeError(400, "duplicate_position", "Provide each checked position only once");
+            }
+        }
+        int matched = 0;
+        JsonArray missing = new JsonArray();
+        JsonArray mismatched = new JsonArray();
+        JsonArray unavailable = new JsonArray();
+        for (var entry : expected.entrySet()) {
+            BlockPos position = entry.getKey();
+            JsonObject row = new JsonObject();
+            row.add("position", positionJson(position));
+            row.addProperty("expected", ForgeRegistries.BLOCKS.getKey(entry.getValue()).toString());
+            if (!level.isInWorldBounds(position) || !level.hasChunkAt(position)) {
+                row.addProperty("reason", level.isInWorldBounds(position) ? "chunk_not_loaded" : "out_of_bounds");
+                unavailable.add(row);
+                continue;
+            }
+            BlockState actual = level.getBlockState(position);
+            if (actual.is(entry.getValue())) {
+                matched++;
+            } else {
+                row.addProperty("actual", ForgeRegistries.BLOCKS.getKey(actual.getBlock()).toString());
+                (actual.isAir() ? missing : mismatched).add(row);
+            }
+        }
+        JsonObject result = new JsonObject();
+        result.addProperty("dimension", dimension.toString());
+        result.addProperty("checked", expected.size() - unavailable.size());
+        result.addProperty("matched", matched);
+        result.add("missing", missing);
+        result.add("mismatched", mismatched);
+        result.add("unavailable", unavailable);
+        return result;
+    }
+
     private JsonObject onServerThread(MinecraftServer server, Supplier<JsonObject> action) {
+        return onServerThread(server, 5, action);
+    }
+
+    private JsonObject onServerThread(MinecraftServer server, int completionTimeoutSeconds, Supplier<JsonObject> action) {
         CompletableFuture<JsonObject> result = new CompletableFuture<>();
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(4);
         server.execute(() -> {
@@ -671,7 +929,7 @@ public final class MinecraftAutomationBridge {
             }
         });
         try {
-            return result.get(5, TimeUnit.SECONDS);
+            return result.get(completionTimeoutSeconds, TimeUnit.SECONDS);
         } catch (TimeoutException exception) {
             throw new BridgeError(504, "world_timeout", "Game server did not respond in time");
         } catch (InterruptedException exception) {
@@ -700,6 +958,7 @@ public final class MinecraftAutomationBridge {
         if (server != null) {
             status.addProperty("world", server.getWorldData().getLevelName());
             status.addProperty("worldFolder", worldFolder(server));
+            status.addProperty("doTraderSpawning", server.getGameRules().getBoolean(GameRules.RULE_DO_TRADER_SPAWNING));
             if (!server.getPlayerList().getPlayers().isEmpty()) {
                 ServerPlayer player = server.getPlayerList().getPlayers().get(0);
                 status.addProperty("dimension", player.serverLevel().dimension().location().toString());
@@ -709,12 +968,60 @@ public final class MinecraftAutomationBridge {
         return status;
     }
 
+    private JsonObject setWanderingTraderSpawning(MinecraftServer server, String expectedWorld, boolean enabled) {
+        if (server != activeWorld || !worldFolder(server).equals(expectedWorld)) {
+            throw new BridgeError(409, "world_changed", "The loaded singleplayer save does not match expectedWorldFolder");
+        }
+        var rule = server.getGameRules().getRule(GameRules.RULE_DO_TRADER_SPAWNING);
+        if (rule.get() != enabled) {
+            rule.set(enabled, server);
+            server.saveEverything(true, true, false);
+        }
+        return gameStatus(server);
+    }
+
+    private JsonObject setOverworldChunksToPlains(MinecraftServer server, String expectedWorld,
+                                                 int minX, int maxX, int minZ, int maxZ) {
+        if (server != activeWorld || !worldFolder(server).equals(expectedWorld)) {
+            throw new BridgeError(409, "world_changed", "The loaded singleplayer save does not match expectedWorldFolder");
+        }
+        if (minX < -1875000 || maxX > 1874999 || minZ < -1875000 || maxZ > 1874999
+                || minX > maxX || minZ > maxZ || (long) (maxX - minX + 1) * (maxZ - minZ + 1) > 64) {
+            throw new BridgeError(400, "invalid_chunk_bounds", "Select between 1 and 64 Overworld chunks");
+        }
+        var level = server.overworld();
+        var plains = level.registryAccess().registryOrThrow(Registries.BIOME).getHolderOrThrow(Biomes.PLAINS);
+        var sampler = level.getChunkSource().randomState().sampler();
+        List<ChunkAccess> chunks = new ArrayList<>();
+        for (int z = minZ; z <= maxZ; z++) {
+            for (int x = minX; x <= maxX; x++) {
+                chunks.add(level.getChunk(x, z));
+            }
+        }
+        for (ChunkAccess chunk : chunks) {
+            chunk.fillBiomesFromNoise((x, y, z, climate) -> plains, sampler);
+            chunk.setUnsaved(true);
+        }
+        level.getChunkSource().chunkMap.resendBiomesForChunks(chunks);
+        JsonObject result = new JsonObject();
+        result.addProperty("worldFolder", expectedWorld);
+        result.addProperty("biome", "minecraft:plains");
+        result.addProperty("chunksUpdated", chunks.size());
+        return result;
+    }
+
+    private static void requireExpectedWorld(MinecraftServer server, String expectedWorld) {
+        if (!worldFolder(server).equals(expectedWorld)) {
+            throw new BridgeError(409, "world_changed", "The loaded singleplayer save does not match expectedWorldFolder");
+        }
+    }
+
     private static String worldFolder(MinecraftServer server) {
         return server.getWorldPath(LevelResource.ROOT).normalize().getFileName().toString();
     }
 
     private static BlockLocation location(JsonObject data) {
-        return new BlockLocation(dimension(data), position(data));
+        return new BlockLocation(dimension(data), position(data), optionalSide(data));
     }
 
     private static ServerLevel loadedLevel(MinecraftServer server, ResourceLocation dimension, BlockPos position) {
@@ -760,6 +1067,7 @@ public final class MinecraftAutomationBridge {
         output.addProperty("dimension", level.dimension().location().toString());
         output.add("position", positionJson(position));
         output.addProperty("block", ForgeRegistries.BLOCKS.getKey(state.getBlock()).toString());
+        level.getBiome(position).unwrapKey().ifPresent(key -> output.addProperty("biome", key.location().toString()));
         JsonObject properties = new JsonObject();
         state.getValues().forEach((property, value) -> properties.addProperty(property.getName(), value.toString()));
         output.add("properties", properties);
@@ -834,6 +1142,26 @@ public final class MinecraftAutomationBridge {
         }
     }
 
+    private static Direction optionalSide(JsonObject data) {
+        return optionalSide(data, "side");
+    }
+
+    private static Direction optionalSide(JsonObject data, String field) {
+        return data.has(field) ? side(data, field) : null;
+    }
+
+    private static Direction side(JsonObject data) {
+        return side(data, "side");
+    }
+
+    private static Direction side(JsonObject data, String field) {
+        Direction side = Direction.byName(stringField(data, field));
+        if (side == null) {
+            throw new IllegalArgumentException("Invalid block side");
+        }
+        return side;
+    }
+
     private static boolean transferDirection(String direction, String endpoint, String errorMessage) {
         boolean inbound = direction.equals("to_" + endpoint);
         if (!inbound && !direction.equals("from_" + endpoint)) {
@@ -882,6 +1210,27 @@ public final class MinecraftAutomationBridge {
             throw new IllegalArgumentException("Missing object: " + key);
         }
         return data.getAsJsonObject(key);
+    }
+
+    private static Map<BlockPos, ResourceLocation> multiblockParts(JsonObject request) {
+        if (!request.has("parts")) {
+            return Map.of();
+        }
+        if (!request.get("parts").isJsonArray() || request.getAsJsonArray("parts").size() > 128) {
+            throw new BridgeError(400, "invalid_parts", "Specify at most 128 part substitutions");
+        }
+        var parts = new LinkedHashMap<BlockPos, ResourceLocation>();
+        for (var element : request.getAsJsonArray("parts")) {
+            if (!element.isJsonObject()) {
+                throw new BridgeError(400, "invalid_part", "Provide an offset and block for each part");
+            }
+            var part = element.getAsJsonObject();
+            BlockPos offset = coordinates(objectField(part, "offset"));
+            if (parts.putIfAbsent(offset, resourceId(part, "block")) != null) {
+                throw new BridgeError(400, "duplicate_part", "Choose distinct port offsets");
+            }
+        }
+        return parts;
     }
 
     private static BlockPos position(JsonObject data) {
@@ -937,9 +1286,13 @@ public final class MinecraftAutomationBridge {
         exchange.getResponseBody().write(body);
     }
 
-    private record BlockLocation(ResourceLocation dimension, BlockPos position) {
+    private record BlockLocation(ResourceLocation dimension, BlockPos position, Direction side) {
         ServerLevel level(MinecraftServer server) {
             return loadedLevel(server, dimension, position);
+        }
+
+        MeOperations.Endpoint me(MinecraftServer server) {
+            return new MeOperations.Endpoint(level(server), position, side);
         }
     }
 

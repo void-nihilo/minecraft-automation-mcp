@@ -15,7 +15,7 @@ record CheatPermissions(boolean allowTestFixtures, boolean allowTestBlockWrites)
         try {
             Files.writeString(path, """
                     # Changes take effect while Minecraft is running.
-                    # Allow test fixtures that can create items, fluids, energy, or blocks.
+                    # Allow test fixtures that can create test items or blocks.
                     allowTestFixtures=false
                     # Allow set_test_block at the configured test coordinate.
                     allowTestBlockWrites=false
@@ -48,13 +48,7 @@ record CheatPermissions(boolean allowTestFixtures, boolean allowTestBlockWrites)
         return switch (operation) {
             case "set_test_block" -> Permission.TEST_BLOCK_WRITES;
             case "verify_tree_farm",
-                    "prepare_chest_test", "prepare_tank_test", "prepare_me_test",
-                    "prepare_me_fluid_cell", "prepare_me_workbench_test",
-                    "prepare_gt_coal_test", "prepare_gt_duct_tape_test",
-                    "prepare_gt_circuit_logs_test", "prepare_gt_hatch_charge_test",
-                    "prepare_gt_furnace_test", "prepare_gt_materials_test",
-                    "prepare_gt_recipe_inputs_test", "start_gt_recipe_power_test",
-                    "stop_gt_recipe_power_test" -> Permission.TEST_FIXTURES;
+                    "prepare_chest_test", "prepare_me_workbench_test" -> Permission.TEST_FIXTURES;
             default -> null;
         };
     }

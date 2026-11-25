@@ -4,6 +4,7 @@ import appeng.api.config.Actionable;
 import appeng.api.crafting.PatternDetailsHelper;
 import appeng.api.stacks.AEItemKey;
 import appeng.api.stacks.AEKey;
+import appeng.api.stacks.KeyCounter;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
@@ -85,21 +86,54 @@ final class MeWorkbenchOperations {
         return result;
     }
 
-    static JsonObject craft(ServerLevel level, BlockPos drive, ResourceLocation recipeId, JsonArray gridRequest) {
+    static JsonObject craft(MeOperations.Endpoint endpoint, ResourceLocation recipeId, JsonArray gridRequest) {
+        CraftingRecipe recipe = recipe(endpoint.level(), recipeId);
+        var grid = endpoint.grid();
+        var stacks = grid.getStorageService().getInventory().getAvailableStacks();
+        return craft(endpoint.level(), grid, recipe, resolveGrid(stacks, gridRequest)).result();
+    }
+
+    static JsonObject craftBatch(MeOperations.Endpoint endpoint, ResourceLocation recipeId,
+                                 JsonArray gridRequest, int repetitions) {
+        var recipe = recipe(endpoint.level(), recipeId);
+        var grid = endpoint.grid();
+        var storage = grid.getStorageService().getInventory();
+        AEItemKey[] selected = resolveGrid(storage.getAvailableStacks(), gridRequest);
+        JsonObject result = new JsonObject();
+        result.addProperty("recipe", recipeId.toString());
+        result.addProperty("requested", repetitions);
+        JsonArray crafts = new JsonArray();
+        for (int index = 0; index < repetitions; index++) {
+            try {
+                Craft craft = craft(endpoint.level(), grid, recipe, selected);
+                crafts.add(craft.result());
+                for (int slot = 0; slot < GRID_SIZE; slot++) {
+                    ItemStack remainder = craft.remainders().get(slot);
+                    if (selected[slot] != null && !remainder.isEmpty() && remainder.isDamageableItem()
+                            && remainder.is(selected[slot].getItem())) {
+                        selected[slot] = AEItemKey.of(remainder);
+                    }
+                }
+            } catch (BridgeError exception) {
+                JsonObject error = new JsonObject();
+                error.addProperty("code", exception.code());
+                error.addProperty("message", exception.getMessage());
+                result.add("blocked", error);
+                break;
+            }
+        }
+        result.addProperty("completed", crafts.size());
+        result.add("crafts", crafts);
+        return result;
+    }
+
+    private static AEItemKey[] resolveGrid(KeyCounter stacks, JsonArray gridRequest) {
         if (gridRequest.size() != GRID_SIZE) {
             throw new BridgeError(400, "invalid_crafting_grid", "Supply nine row-major grid slots");
         }
-        CraftingRecipe recipe = recipe(level, recipeId);
-        var grid = MeOperations.gridAt(level, drive);
-        var storage = grid.getStorageService().getInventory();
-        var actor = MeOperations.playerAction(level);
-        var initial = storage.getAvailableStacks();
-        var craftingGrid = new TransientCraftingContainer(new WorkbenchMenu(), 3, 3);
-        Map<AEItemKey, Integer> inputs = new LinkedHashMap<>();
-        List<ItemStack> sourceSlots = new ArrayList<>(GRID_SIZE);
+        AEItemKey[] selected = new AEItemKey[GRID_SIZE];
         for (int slot = 0; slot < GRID_SIZE; slot++) {
             JsonElement requested = gridRequest.get(slot);
-            ItemStack item = ItemStack.EMPTY;
             if (!requested.isJsonNull()) {
                 if (!requested.isJsonObject()) {
                     throw new BridgeError(400, "invalid_crafting_grid", "A slot must be an item object or null");
@@ -107,7 +141,24 @@ final class MeWorkbenchOperations {
                 JsonObject entry = requested.getAsJsonObject();
                 ResourceLocation id = MinecraftAutomationBridge.resourceId(entry, "item");
                 String token = MinecraftAutomationBridge.stringField(entry, "expectedSourceToken");
-                AEItemKey key = MeOperations.resolveMeStack(initial, AEItemKey.class, id, token);
+                selected[slot] = MeOperations.resolveMeStack(stacks, AEItemKey.class, id, token);
+            }
+        }
+        return selected;
+    }
+
+    private static Craft craft(ServerLevel level, appeng.api.networking.IGrid grid, CraftingRecipe recipe,
+                               AEItemKey[] selected) {
+        var storage = grid.getStorageService().getInventory();
+        var actor = MeOperations.playerAction(level);
+        var initial = storage.getAvailableStacks();
+        var craftingGrid = new TransientCraftingContainer(new WorkbenchMenu(), 3, 3);
+        Map<AEItemKey, Integer> inputs = new LinkedHashMap<>();
+        List<ItemStack> sourceSlots = new ArrayList<>(GRID_SIZE);
+        for (int slot = 0; slot < GRID_SIZE; slot++) {
+            AEItemKey key = selected[slot];
+            ItemStack item = ItemStack.EMPTY;
+            if (key != null) {
                 item = key.toStack();
                 inputs.merge(key, 1, Integer::sum);
             }
@@ -148,29 +199,33 @@ final class MeWorkbenchOperations {
         Map<AEItemKey, Long> balances = new LinkedHashMap<>();
         inputs.keySet().forEach(key -> balances.put(key, initial.get(key)));
         produced.keySet().forEach(key -> balances.putIfAbsent(key, initial.get(key)));
+        Map<AEItemKey, Long> expectedBalances = new LinkedHashMap<>(balances);
 
         try {
             for (var entry : inputs.entrySet()) {
                 var key = entry.getKey();
                 int amount = entry.getValue();
-                if (MeOperations.mutateMe(grid, storage, actor, key, amount, false, Actionable.MODULATE) != amount
-                        || MeOperations.count(storage, key) != balances.get(key) - amount) {
+                long extracted = MeOperations.mutateMe(grid, storage, actor, key, amount, false, Actionable.MODULATE);
+                long after = MeOperations.count(storage, key);
+                if (extracted != amount || !MeOperations.matchesWithdrawal(balances.get(key), amount, after)) {
                     throw new BridgeError(409, "craft_input_refused", "ME did not provide the planned input " + key.getId());
                 }
+                expectedBalances.put(key, after);
             }
             for (var entry : produced.entrySet()) {
                 var key = entry.getKey();
                 int amount = entry.getValue();
+                long before = expectedBalances.get(key);
+                long expected = before > Long.MAX_VALUE - amount ? Long.MAX_VALUE : before + amount;
                 if (MeOperations.mutateMe(grid, storage, actor, key, amount, true, Actionable.SIMULATE) != amount
                         || MeOperations.mutateMe(grid, storage, actor, key, amount, true, Actionable.MODULATE) != amount
-                        || MeOperations.count(storage, key) != balances.get(key) - inputs.getOrDefault(key, 0) + amount) {
+                        || MeOperations.count(storage, key) != expected) {
                     throw new BridgeError(409, "craft_output_refused", "ME cannot retain the result or remainder " + key.getId());
                 }
+                expectedBalances.put(key, expected);
             }
-            for (var entry : balances.entrySet()) {
-                var key = entry.getKey();
-                long expected = entry.getValue() - inputs.getOrDefault(key, 0) + produced.getOrDefault(key, 0);
-                if (MeOperations.count(storage, key) != expected) {
+            for (var entry : expectedBalances.entrySet()) {
+                if (MeOperations.count(storage, entry.getKey()) != entry.getValue()) {
                     throw new BridgeError(409, "craft_balance_mismatch", "ME did not retain the planned item balance");
                 }
             }
@@ -192,7 +247,7 @@ final class MeWorkbenchOperations {
         }
 
         JsonObject result = new JsonObject();
-        result.addProperty("recipe", recipeId.toString());
+        result.addProperty("recipe", recipe.getId().toString());
         result.add("output", itemInfo(output));
         JsonObject withdrawn = new JsonObject();
         Map<ResourceLocation, Integer> inputCounts = new LinkedHashMap<>();
@@ -213,8 +268,10 @@ final class MeWorkbenchOperations {
             }
         }
         result.add("remainders", returned);
-        return result;
+        return new Craft(result, remainders);
     }
+
+    private record Craft(JsonObject result, List<ItemStack> remainders) {}
 
     static ItemStack encodePattern(ServerLevel level, ResourceLocation recipeId, ItemStack[] inputs) {
         CraftingRecipe recipe = recipe(level, recipeId);
@@ -276,7 +333,34 @@ final class MeWorkbenchOperations {
             requireTestItem(required, "gtceu:iron_hammer", 1);
             requireTestItem(required, "gtceu:iron_wrench", 1);
         }
-        return GtProductionTestFixtures.prepareStock(level, drive, required);
+        var grid = new MeOperations.Endpoint(level, drive, null).grid();
+        var actor = MeOperations.playerAction(level);
+        var storage = grid.getStorageService().getInventory();
+        Map<AEKey, Long> balances = new LinkedHashMap<>();
+        JsonObject seeded = new JsonObject();
+        try {
+            for (var entry : required.entrySet()) {
+                AEKey key = entry.getKey();
+                long before = MeOperations.count(storage, key);
+                balances.put(key, before);
+                long shortage = entry.getValue() - before;
+                if (shortage <= 0) {
+                    continue;
+                }
+                if (MeOperations.mutateMe(grid, storage, actor, key, shortage, true, Actionable.SIMULATE) != shortage
+                        || MeOperations.mutateMe(grid, storage, actor, key, shortage, true, Actionable.MODULATE) != shortage
+                        || MeOperations.count(storage, key) != entry.getValue()) {
+                    throw new BridgeError(409, "fixture_refused", "ME did not retain the test input " + key.getId());
+                }
+                seeded.addProperty(key.getId().toString(), shortage);
+            }
+        } catch (RuntimeException failure) {
+            balances.forEach((key, before) -> MeOperations.restoreMe(storage, actor, key, before));
+            throw failure;
+        }
+        JsonObject result = new JsonObject();
+        result.add("seeded", seeded);
+        return result;
     }
 
     private static void requireTestItem(Map<AEKey, Integer> required, String name, int amount) {

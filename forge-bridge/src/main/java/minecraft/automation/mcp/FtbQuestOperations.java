@@ -1,5 +1,6 @@
 package minecraft.automation.mcp;
 
+import appeng.api.stacks.AEItemKey;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
@@ -11,8 +12,10 @@ import dev.ftb.mods.ftbquests.quest.QuestObject;
 import dev.ftb.mods.ftbquests.quest.QuestObjectBase;
 import dev.ftb.mods.ftbquests.quest.ServerQuestFile;
 import dev.ftb.mods.ftbquests.quest.TeamData;
+import dev.ftb.mods.ftbquests.quest.reward.ChoiceReward;
 import dev.ftb.mods.ftbquests.quest.reward.ItemReward;
 import dev.ftb.mods.ftbquests.quest.reward.Reward;
+import dev.ftb.mods.ftbquests.quest.task.CheckmarkTask;
 import dev.ftb.mods.ftbquests.quest.task.FluidTask;
 import dev.ftb.mods.ftbquests.quest.task.ItemTask;
 import dev.ftb.mods.ftbquests.quest.task.Task;
@@ -21,6 +24,7 @@ import dev.ftb.mods.ftbteams.api.FTBTeamsAPI;
 import dev.ftb.mods.ftbteams.api.Team;
 import minecraft.automation.mcp.MinecraftAutomationBridge.BridgeError;
 import net.minecraft.network.chat.Component;
+import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.item.ItemStack;
@@ -37,7 +41,12 @@ import java.util.function.Function;
 final class FtbQuestOperations {
     private FtbQuestOperations() {}
 
-    static JsonObject read(MinecraftServer server, String operation, JsonObject request) {
+    static JsonObject run(MinecraftServer server, String operation, JsonObject request) {
+        return run(server, operation, request, null);
+    }
+
+    static JsonObject run(MinecraftServer server, String operation, JsonObject request,
+                          MeOperations.Endpoint endpoint) {
         ServerQuestFile file = ServerQuestFile.INSTANCE;
         if (file == null || file.isLoading() || !FTBTeamsAPI.api().isManagerLoaded()) {
             throw new BridgeError(409, "ftb_quests_not_ready", "The FTB quest book or teams are still loading");
@@ -53,7 +62,8 @@ final class FtbQuestOperations {
             // Keep new-team reads out of the quest file's persistent team map.
             data = new TeamData(team.getId(), file);
         }
-        QuestView view = new QuestView(data, player.getUUID(), loadDefaultTranslations(file.getFolder()));
+        JsonObject translations = loadDefaultTranslations(file.getFolder());
+        QuestView view = new QuestView(data, player.getUUID(), translations);
         return switch (operation) {
             case "list_ftb_quest_chapters" -> page(file.getAllChapters(), request, "chapters", view::chapter);
             case "list_ftb_quests" -> listQuests(file, view, request);
@@ -64,8 +74,116 @@ final class FtbQuestOperations {
                 }
                 yield view.detail(quest);
             }
+            case "check_ftb_task" -> {
+                Quest quest = checkTask(file, team, view, player, request);
+                yield new QuestView(file.getOrCreateTeamData(team), player.getUUID(), translations).detail(quest);
+            }
+            case "submit_ftb_item_from_me" -> submitItem(file, team, view, player, request, endpoint);
+            case "claim_ftb_reward" -> {
+                Quest quest = claimReward(file, view, player, request);
+                yield view.detail(quest);
+            }
             default -> throw new IllegalArgumentException("Unknown FTB quest operation");
         };
+    }
+
+    private static Quest checkTask(ServerQuestFile file, Team team, QuestView view, ServerPlayer player, JsonObject request) {
+        Task task = file.getTask(id(request, "taskId"));
+        if (task == null) {
+            throw new BridgeError(404, "ftb_task_not_found", "No FTB task matches taskId");
+        }
+        if (!(task instanceof CheckmarkTask checkmark)) {
+            throw new BridgeError(409, "ftb_not_checkmark", "Only checkmark tasks can be checked off");
+        }
+        Quest quest = checkmark.getQuest();
+        if (view.data.isCompleted(checkmark)) {
+            return quest;
+        }
+        if (view.data.isLocked() || !view.data.canStartTasks(quest)) {
+            throw new BridgeError(409, "ftb_task_locked", "The team or quest is locked");
+        }
+        TeamData data = file.getOrCreateTeamData(team);
+        file.withPlayerContext(player, () -> checkmark.submitTask(data, player));
+        if (!data.isCompleted(checkmark)) {
+            throw new BridgeError(409, "ftb_checkmark_not_completed", "FTB did not accept this checkmark yet; check the task order");
+        }
+        return quest;
+    }
+
+    private static JsonObject submitItem(ServerQuestFile file, Team team, QuestView view, ServerPlayer player,
+                                         JsonObject request, MeOperations.Endpoint endpoint) {
+        Task task = file.getTask(id(request, "taskId"));
+        if (!(task instanceof ItemTask itemTask) || !itemTask.canInsertItem()) {
+            throw new BridgeError(409, "ftb_not_insertable", "FTB requires a resource-consuming item task that accepts insertion");
+        }
+        Quest quest = itemTask.getQuest();
+        if (view.data.isLocked() || !view.data.canStartTasks(quest) || view.data.isCompleted(itemTask)) {
+            throw new BridgeError(409, "ftb_task_locked", "The task is locked or already finished");
+        }
+        int amount = MinecraftAutomationBridge.coordinate(request, "amount");
+        if (amount < 1 || amount > 64) {
+            throw new BridgeError(400, "invalid_ftb_amount", "Submit one to 64 items per call");
+        }
+        ResourceLocation item = ResourceLocation.tryParse(MinecraftAutomationBridge.stringField(request, "item"));
+        if (item == null) {
+            throw new BridgeError(400, "invalid_ftb_item", "Use an item registry ID");
+        }
+        String token = MinecraftAutomationBridge.stringField(request, "expectedSourceToken");
+        var grid = endpoint.grid();
+        var actor = MeOperations.playerAction(endpoint.level());
+        var storage = grid.getStorageService().getInventory();
+        AEItemKey key = MeOperations.resolveMeStack(storage, AEItemKey.class, item, token);
+        ItemStack offered = key.toStack(amount);
+        TeamData data = file.getOrCreateTeamData(team);
+        if (itemTask.insert(data, offered.copy(), true).getCount() != 0) {
+            throw new BridgeError(409, "ftb_items_refused", "FTB rejected some or all of the requested items");
+        }
+        MeOperations.withdraw(grid, storage, actor, key, amount, MeOperations.count(storage, key), () ->
+                file.withPlayerContext(player, () -> {
+                    if (!itemTask.insert(data, offered, false).isEmpty()) {
+                        throw new BridgeError(409, "ftb_items_refused", "FTB did not accept the requested items");
+                    }
+                }), () -> { });
+        JsonObject result = view.detail(quest);
+        result.addProperty("submitted", amount);
+        result.addProperty("item", item.toString());
+        return result;
+    }
+
+    private static Quest claimReward(ServerQuestFile file, QuestView view, ServerPlayer player, JsonObject request) {
+        Reward reward = file.getReward(id(request, "rewardId"));
+        if (reward == null) {
+            throw new BridgeError(404, "ftb_reward_not_found", "No FTB reward matches rewardId");
+        }
+        Quest quest = reward.getQuest();
+        TeamData data = view.data;
+        var status = data.getClaimType(view.playerId, reward);
+        if (status.isClaimed()) {
+            return quest;
+        }
+        if (!status.canClaim()) {
+            throw new BridgeError(409, "ftb_reward_locked", "Complete the quest before claiming its reward");
+        }
+        if (reward instanceof ChoiceReward choice) {
+            var table = choice.getTable();
+            int index = request.has("choiceIndex") ? MinecraftAutomationBridge.coordinate(request, "choiceIndex") : -1;
+            if (table == null || index < 0 || index >= table.getWeightedRewards().size()) {
+                throw new BridgeError(400, "ftb_reward_choice_required", "Choose a valid choiceIndex from the quest reward options");
+            }
+            Reward selected = table.getWeightedRewards().get(index).getReward();
+            if (data.markRewardAsClaimed(view.playerId, reward, System.currentTimeMillis())) {
+                selected.claim(player, true);
+            }
+        } else {
+            if (request.has("choiceIndex")) {
+                throw new BridgeError(400, "ftb_reward_not_choice", "choiceIndex is only valid for a choice reward");
+            }
+            data.claimReward(player, reward, true);
+        }
+        if (!data.isRewardClaimed(view.playerId, reward)) {
+            throw new BridgeError(409, "ftb_reward_not_claimed", "FTB did not mark this reward as claimed");
+        }
+        return quest;
     }
 
     private static JsonObject listQuests(ServerQuestFile file, QuestView view, JsonObject request) {
@@ -229,9 +347,23 @@ final class FtbQuestOperations {
         }
 
         private JsonObject reward(Reward reward) {
+            JsonObject result = rewardInfo(reward);
+            result.addProperty("claimStatus", data.getClaimType(playerId, reward).name().toLowerCase(Locale.ROOT));
+            if (reward instanceof ChoiceReward choice && choice.getTable() != null) {
+                JsonArray options = new JsonArray();
+                for (var entry : choice.getTable().getWeightedRewards()) {
+                    JsonObject option = rewardInfo(entry.getReward());
+                    option.addProperty("choiceIndex", options.size());
+                    options.add(option);
+                }
+                result.add("choices", options);
+            }
+            return result;
+        }
+
+        private JsonObject rewardInfo(Reward reward) {
             JsonObject result = describeIdentity(reward);
             result.addProperty("type", reward.getType().getTypeId().toString());
-            result.addProperty("claimStatus", data.getClaimType(playerId, reward).name().toLowerCase(Locale.ROOT));
             if (reward instanceof ItemReward item) {
                 addItem(result, item.getItem());
                 result.addProperty("count", item.getCount());
