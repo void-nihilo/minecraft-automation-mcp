@@ -57,7 +57,7 @@ allowTestBlockWrites=false
 
 ## Prism 后台启动
 
-按项目约定，Prism Launcher 和 Minecraft 实例默认在后台启动，保留当前前台窗口的焦点和鼠标控制。要启用桥接模组的后台窗口设置，在实例游戏目录的 `config/` 下创建空文件 `minecraft-automation-mcp-background-start`，或将已有的后台启动标记改为此文件名，然后启动实例。Windows 上，Minecraft 以无边框方式填满显示器工作区，并尝试切换到英文直接输入。后台自动进入单人存档时，游戏继续运行，鼠标捕获等到第一次点击游戏画面才启用。
+按项目约定，Prism Launcher 和 Minecraft 实例默认在后台启动，保留当前前台窗口的焦点和鼠标控制。要启用桥接模组的后台窗口设置，在实例游戏目录的 `config/` 下创建空文件 `minecraft-automation-mcp-background-start`，或将已有的后台启动标记改为此文件名，然后启动实例。Windows 上，Minecraft 以无边框方式填满显示器工作区。后台自动进入单人存档时，游戏继续运行，鼠标捕获等到第一次点击游戏画面才启用。
 
 ## MCP 工具
 

@@ -18,7 +18,6 @@ abstract class BackgroundClientMixin {
             if (BackgroundInput.isBackgroundWindowPending()) {
                 BackgroundInput.maximizeBorderlessWithoutFocus(game.getWindow());
             }
-            BackgroundInput.useEnglish(game.getWindow().getWindow());
             String world = config.quickPlay.singleplayer();
             BackgroundInput.finishClientConstruction(world != null && !world.isBlank());
         }

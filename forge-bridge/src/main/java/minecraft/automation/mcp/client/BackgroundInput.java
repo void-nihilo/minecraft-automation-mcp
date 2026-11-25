@@ -4,8 +4,6 @@ import com.mojang.blaze3d.platform.Monitor;
 import com.mojang.blaze3d.platform.Window;
 import com.mojang.logging.LogUtils;
 import com.sun.jna.Function;
-import com.sun.jna.Memory;
-import com.sun.jna.Native;
 import com.sun.jna.NativeLibrary;
 import com.sun.jna.Platform;
 import com.sun.jna.Pointer;
@@ -18,7 +16,6 @@ import java.nio.file.Path;
 
 public final class BackgroundInput {
     private static final Logger LOGGER = LogUtils.getLogger();
-    private static final int ENGLISH_US = 0x0409;
     private static final int SWP_NOZORDER = 0x0004;
     private static final int SWP_NOACTIVATE = 0x0010;
     private static final int SWP_FRAMECHANGED = 0x0020;
@@ -83,65 +80,6 @@ public final class BackgroundInput {
             LOGGER.warn("Minecraft Automation MCP could not size the background window", failure);
             return false;
         }
-    }
-
-    public static void useEnglish(long window) {
-        if (!Platform.isWindows()) {
-            return;
-        }
-        try {
-            long hwnd = GLFWNativeWin32.glfwGetWin32Window(window);
-            Pointer handle = new Pointer(hwnd);
-            NativeLibrary user = NativeLibrary.getInstance("user32");
-            Function currentLayout = winFunction(user, "GetKeyboardLayout");
-            if (language(currentLayout.invokePointer(new Object[] {0})) != ENGLISH_US) {
-                Pointer english = findEnglishLayout(user);
-                if (english != null) {
-                    winFunction(user, "ActivateKeyboardLayout").invokePointer(new Object[] {english, 0});
-                }
-            }
-            int active = language(currentLayout.invokePointer(new Object[] {0}));
-            boolean directEnglish = active == ENGLISH_US || closeIme(handle);
-            LOGGER.info("Minecraft Automation MCP background input: layout={}, directEnglish={}", Integer.toHexString(active), directEnglish);
-        } catch (RuntimeException | LinkageError failure) {
-            LOGGER.warn("Minecraft Automation MCP could not configure the game window's English input", failure);
-        }
-    }
-
-    private static Pointer findEnglishLayout(NativeLibrary user) {
-        Function list = winFunction(user, "GetKeyboardLayoutList");
-        int count = list.invokeInt(new Object[] {0, null});
-        if (count <= 0) {
-            return null;
-        }
-        try (Memory layouts = new Memory((long) count * Native.POINTER_SIZE)) {
-            int copied = list.invokeInt(new Object[] {count, layouts});
-            for (int i = 0; i < copied; i++) {
-                Pointer layout = layouts.getPointer((long) i * Native.POINTER_SIZE);
-                if (language(layout) == ENGLISH_US) {
-                    return layout;
-                }
-            }
-        }
-        return null;
-    }
-
-    private static boolean closeIme(Pointer window) {
-        NativeLibrary imm = NativeLibrary.getInstance("imm32");
-        Pointer context = winFunction(imm, "ImmGetContext").invokePointer(new Object[] {window});
-        if (context == null) {
-            return false;
-        }
-        try {
-            winFunction(imm, "ImmSetOpenStatus").invokeInt(new Object[] {context, 0});
-            return winFunction(imm, "ImmGetOpenStatus").invokeInt(new Object[] {context}) == 0;
-        } finally {
-            winFunction(imm, "ImmReleaseContext").invokeInt(new Object[] {window, context});
-        }
-    }
-
-    private static int language(Pointer layout) {
-        return (int) (Pointer.nativeValue(layout) & 0xffff);
     }
 
     private static Function winFunction(NativeLibrary library, String name) {
